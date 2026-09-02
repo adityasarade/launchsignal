@@ -67,17 +67,7 @@ _SPEEDRUN_CLAIM = re.compile(
 
 #: Words that are never part of a company name and mark the end of one.
 _STOP_WORDS = frozenset(
-    """a an and the at in on to for of our we us i my me is are was were be been
-    after before come join us joining building built build launch launched
-    launching today now next excited thrilled proud happy announce announcing
-    announced share sharing news huge big finally officially just been from with
-    that this these those it its as so very really super along here there where
-    when what who how why all more most some any their his her they he she you
-    your yc combinator speedrun a16z batch cohort accelerator company startup
-    startups sf san francisco york city team last year years month months week
-    weeks day days going all backed funded raise raised round seed pre
-    introducing launching announcing meet presenting welcome welcoming
-    thrilled excited proud delighted stoked psyched""".split()
+    ["a", "an", "and", "the", "at", "in", "on", "to", "for", "of", "our", "we", "us", "i", "my", "me", "is", "are", "was", "were", "be", "been", "after", "before", "come", "join", "us", "joining", "building", "built", "build", "launch", "launched", "launching", "today", "now", "next", "excited", "thrilled", "proud", "happy", "announce", "announcing", "announced", "share", "sharing", "news", "huge", "big", "finally", "officially", "just", "been", "from", "with", "that", "this", "these", "those", "it", "its", "as", "so", "very", "really", "super", "along", "here", "there", "where", "when", "what", "who", "how", "why", "all", "more", "most", "some", "any", "their", "his", "her", "they", "he", "she", "you", "your", "yc", "combinator", "speedrun", "a16z", "batch", "cohort", "accelerator", "company", "startup", "startups", "sf", "san", "francisco", "york", "city", "team", "last", "year", "years", "month", "months", "week", "weeks", "day", "days", "going", "all", "backed", "funded", "raise", "raised", "round", "seed", "pre", "introducing", "launching", "announcing", "meet", "presenting", "welcome", "welcoming", "thrilled", "excited", "proud", "delighted", "stoked", "psyched"]
 )
 
 #: Patterns that name a company explicitly, most reliable first. The keyword

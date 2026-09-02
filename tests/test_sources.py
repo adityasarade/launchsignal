@@ -36,16 +36,19 @@ class SitemapParsingTest(unittest.TestCase):
             list(sources._parse_sitemap("<html><meta></html>", sources.YcSitemapSource.slug_pattern, "yc"))
         self.assertIn("not valid XML", str(caught.exception))
 
-    def test_html_error_page_yields_nothing_and_is_caught(self) -> None:
-        """A well-formed HTML error page parses as XML and yields zero entries.
+    def test_html_error_page_is_rejected_not_silently_parsed(self) -> None:
+        """A well-formed HTML error page parses as valid XML and yields nothing.
 
-        Treating that as a clean scan would make the monitor silently blind, so
-        the adapter raises instead.
+        Treating that as a clean scan makes the monitor silently blind, so it is
+        refused. The DOCTYPE guard catches the common case first.
         """
         page = "<!DOCTYPE html><html><body>Access denied</body></html>"
-        self.assertEqual(
-            list(sources._parse_sitemap(page, sources.YcSitemapSource.slug_pattern, "yc")), []
-        )
+        with self.assertRaises(SourceError) as caught:
+            list(sources._parse_sitemap(page, sources.YcSitemapSource.slug_pattern, "yc"))
+        self.assertIn("DOCTYPE", str(caught.exception))
+
+    def test_an_xml_page_with_no_company_urls_is_rejected(self) -> None:
+        page = '<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"/>'
         adapter = sources.YcSitemapSource(enrich=False)
         original = sources.get_text
         sources.get_text = lambda *a, **k: (page, type("R", (), {"etag": None})())
@@ -55,6 +58,22 @@ class SitemapParsingTest(unittest.TestCase):
             self.assertIn("no company URLs", str(caught.exception))
         finally:
             sources.get_text = original
+
+    def test_an_entity_declaration_is_refused(self) -> None:
+        """Entity expansion is the attack vector against the stdlib parser."""
+        bomb = (
+            '<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol">]>'
+            "<urlset><url><loc>x</loc></url></urlset>"
+        )
+        with self.assertRaises(SourceError) as caught:
+            list(sources._parse_sitemap(bomb, sources.YcSitemapSource.slug_pattern, "yc"))
+        self.assertIn("refusing to parse", str(caught.exception))
+
+    def test_an_oversized_document_is_refused(self) -> None:
+        huge = "<urlset>" + ("x" * (sources.MAX_SITEMAP_BYTES + 1))
+        with self.assertRaises(SourceError) as caught:
+            list(sources._parse_sitemap(huge, sources.YcSitemapSource.slug_pattern, "yc"))
+        self.assertIn("exceeds", str(caught.exception))
 
 
 class ProfileEnrichmentTest(unittest.TestCase):

@@ -40,7 +40,22 @@ class SourceError(RuntimeError):
         self.message = message
 
 
-class NotModified(Exception):
+#: Only these schemes may be opened. Endpoints are configurable, so a stray
+#: file:// or custom scheme must be refused rather than fetched.
+ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+
+def require_web_url(url: str, source: str = "http") -> str:
+    """Reject anything that is not an ordinary web URL."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme.lower() not in ALLOWED_SCHEMES:
+        raise SourceError(source, f"refusing to open a non-web URL scheme: {parsed.scheme!r}")
+    if not parsed.netloc:
+        raise SourceError(source, "refusing to open a URL with no host")
+    return url
+
+
+class NotModified(Exception):  # noqa: N818 - a control-flow signal, not an error
     """The upstream resource is unchanged since the stored validator."""
 
 
@@ -87,10 +102,13 @@ def request(
     if etag:
         merged["If-None-Match"] = etag
 
+    require_web_url(url, source)
     last_error = "unknown error"
     for attempt in range(1, attempts + 1):
         try:
-            req = urllib.request.Request(url, headers=merged, method="GET")
+            # Scheme is validated by require_web_url before the loop, so only
+            # http/https can reach here.
+            req = urllib.request.Request(url, headers=merged, method="GET")  # noqa: S310
             with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310
                 raw = response.read()
                 head = {key: value for key, value in response.headers.items()}
@@ -113,7 +131,7 @@ def request(
         if attempt == attempts:
             break
         delay = retry_after if retry_after is not None else backoff ** attempt
-        delay += random.uniform(0, 0.4)
+        delay += random.uniform(0, 0.4)  # noqa: S311 - jitter, not a secret
         LOGGER.warning(
             "%s: %s (attempt %d/%d), retrying in %.1fs", source, last_error, attempt, attempts, delay
         )

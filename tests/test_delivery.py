@@ -1,6 +1,5 @@
 """Delivery safety: exactly-once claiming, dead-lettering, locking."""
 
-import json
 import threading
 import unittest
 

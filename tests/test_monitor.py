@@ -207,7 +207,8 @@ class EarlySignalRoutingTest(MonitorCase):
         self.assertEqual(result["review"], 1)
         queue = self.store.review_items()
         self.assertEqual(len(queue), 1)
-        self.assertEqual(queue[0]["reason"], "company-unresolved")
+        # The reason records *why* resolution failed, for the reviewer.
+        self.assertIn("company-unresolved", str(queue[0]["reason"]))
 
 
 class DeliveryDurabilityTest(MonitorCase):

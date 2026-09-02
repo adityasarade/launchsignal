@@ -11,6 +11,7 @@ touches a page that requires an account.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import html
 import json
@@ -18,11 +19,11 @@ import logging
 import os
 import re
 import urllib.parse
-import xml.etree.ElementTree as element_tree
-from datetime import datetime, timezone
-from typing import Iterable, Iterator, Protocol, runtime_checkable
+import xml.etree.ElementTree as ElementTree
+from collections.abc import Iterable, Iterator
+from typing import Protocol, runtime_checkable
 
-from .http import NotModified, SourceError, get_json, get_text, request
+from .http import NotModified, SourceError, get_json, get_text
 from .models import PROGRAMME_SPEEDRUN, PROGRAMME_YC, Evidence, Source
 
 LOGGER = logging.getLogger("launchsignal.sources")
@@ -188,10 +189,8 @@ def _extract_yc_profile(body: str) -> dict[str, object]:
             out[target] = value.strip()
     website = re.search(r'"url"\s*:\s*("https?://(?:[^"\\]|\\.){0,200}")', unescaped)
     if website:
-        try:
+        with contextlib.suppress(json.JSONDecodeError):
             out["website"] = json.loads(website.group(1))
-        except json.JSONDecodeError:
-            pass
     return out
 
 
@@ -208,12 +207,26 @@ def _yc_batch_label(detail: dict[str, object]) -> str | None:
     return None
 
 
+#: A sitemap this large is not a sitemap. Guards against a decompression or
+#: entity-expansion bomb being handed to the parser.
+MAX_SITEMAP_BYTES = 32 * 1024 * 1024
+
+
 def _parse_sitemap(
     document: str, pattern: re.Pattern[str], source: str
 ) -> Iterator[tuple[str, str, str | None]]:
+    if len(document) > MAX_SITEMAP_BYTES:
+        raise SourceError(
+            source, f"sitemap exceeds {MAX_SITEMAP_BYTES} bytes; refusing to parse"
+        )
+    if re.search(r"<!\s*(?:DOCTYPE|ENTITY)", document[:4096], re.IGNORECASE):
+        # A sitemap has no legitimate reason to declare a doctype or entities,
+        # and both are the vehicle for entity-expansion and external-entity
+        # attacks against the stdlib parser.
+        raise SourceError(source, "sitemap declares a DOCTYPE or ENTITY; refusing to parse")
     try:
-        root = element_tree.fromstring(document)
-    except element_tree.ParseError as error:
+        root = ElementTree.fromstring(document)  # noqa: S314 - guarded above
+    except ElementTree.ParseError as error:
         raise SourceError(source, f"sitemap is not valid XML: {error}") from None
     for node in root.findall(".//s:url", SITEMAP_NS):
         loc = node.find("s:loc", SITEMAP_NS)

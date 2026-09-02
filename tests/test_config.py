@@ -181,3 +181,31 @@ class EnvDuplicateKeyTest(unittest.TestCase):
         self.path.write_text("LS_DUP_B=first\nLS_DUP_B=second\n", encoding="utf-8")
         load_env(str(self.path))
         self.assertEqual(os.environ["LS_DUP_B"], "from-environment")
+
+
+class UrlSchemeGuardTest(unittest.TestCase):
+    """Endpoints are configurable, so a non-web scheme must be refused."""
+
+    def test_non_web_schemes_are_rejected(self) -> None:
+        from launchsignal.http import require_web_url
+
+        for url in (
+            "file:///etc/passwd",
+            "ftp://example.com/x",
+            "gopher://example.com",
+            "data:text/plain,hi",
+        ):
+            with self.assertRaises(SourceError, msg=url):
+                require_web_url(url, "test")
+
+    def test_a_url_with_no_host_is_rejected(self) -> None:
+        from launchsignal.http import require_web_url
+
+        with self.assertRaises(SourceError):
+            require_web_url("https:///nohost", "test")
+
+    def test_ordinary_web_urls_pass(self) -> None:
+        from launchsignal.http import require_web_url
+
+        for url in ("http://example.com", "https://example.com/path?q=1"):
+            self.assertEqual(require_web_url(url, "test"), url)

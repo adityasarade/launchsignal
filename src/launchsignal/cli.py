@@ -110,7 +110,7 @@ def cmd_doctor(args) -> int:
     problems: list[str] = []
     notes: list[str] = []
 
-    if sys.version_info < (3, 12):
+    if sys.version_info < (3, 12):  # noqa: UP036 - a guard for source checkouts
         problems.append(f"Python 3.12+ required, found {sys.version.split()[0]}")
     else:
         notes.append(f"Python {sys.version.split()[0]}")
@@ -206,14 +206,14 @@ def cmd_serve(args) -> int:
                 # Misconfiguration is not transient; stop rather than spin.
                 LOGGER.error("stopping: %s", error)
                 return 1
-            except Exception:  # noqa: BLE001
+            except Exception:
                 # A crash inside one cycle must never end the daemon. The old
                 # loop had no guard, so a single 503 killed the monitor.
                 LOGGER.exception("cycle failed; continuing to the next one")
                 next_full = max(next_full, time.monotonic() + 60)
             # Short sleeps so a signal is noticed promptly, with jitter so many
             # deployments do not hit the same source in lockstep.
-            time.sleep(min(30.0, 5.0 + random.uniform(0, 5)))
+            time.sleep(min(30.0, 5.0 + random.uniform(0, 5)))  # noqa: S311 - jitter
     finally:
         store.close()
     LOGGER.info("stopped cleanly")
@@ -281,7 +281,8 @@ def build_parser() -> argparse.ArgumentParser:
     health.set_defaults(func=cmd_health)
 
     pond = sub.add_parser("pond", help="serve the Pond Protocol V1 control plane")
-    pond.add_argument("--host", default="0.0.0.0")
+    # Containers need every interface; restrict it at the network layer.
+    pond.add_argument("--host", default="0.0.0.0")  # noqa: S104
     pond.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8080")))
     pond.set_defaults(func=cmd_pond)
 

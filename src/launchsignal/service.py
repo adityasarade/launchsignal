@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Iterable
+from collections.abc import Iterable
 
 from .classifier import (
     author_name,
@@ -107,7 +107,7 @@ class Monitor:
             outcome.error = error.message
             self.store.record_source_failure(label, error.message)
             LOGGER.error("source %s failed: %s", label, error.message)
-        except Exception as error:  # noqa: BLE001 - a source must never kill the run
+        except Exception as error:
             outcome.ok = False
             outcome.error = f"{type(error).__name__}: {error}"
             self.store.record_source_failure(label, outcome.error)
@@ -141,7 +141,7 @@ class Monitor:
                         source=evidence.source,
                         url=evidence.url,
                         excerpt=evidence.text[:1000],
-                        reason="company-unresolved",
+                        reason=f"company-unresolved ({reason})",
                     )
                 )
             return False

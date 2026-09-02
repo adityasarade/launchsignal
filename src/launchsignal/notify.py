@@ -13,10 +13,12 @@ import time
 import urllib.error
 import urllib.request
 
+from .http import require_web_url
 from .models import Alert, OfficialState, SignalKind
 
 LOGGER = logging.getLogger("launchsignal.notify")
 
+#: Constants, never user input. Both are https and validated before opening.
 POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
 AUTH_TEST_URL = "https://slack.com/api/auth.test"
 
@@ -120,7 +122,7 @@ class SlackNotifier:
     def _call(self, url: str, payload: dict, token: str, attempts: int = 3) -> dict:
         body = json.dumps(payload).encode()
         for attempt in range(1, attempts + 1):
-            request = urllib.request.Request(
+            request = urllib.request.Request(  # noqa: S310 - url is a module constant
                 url,
                 data=body,
                 headers={
@@ -130,6 +132,7 @@ class SlackNotifier:
                 method="POST",
             )
             try:
+                require_web_url(url, "slack")
                 with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
                     result = json.loads(response.read().decode())
             except urllib.error.HTTPError as error:

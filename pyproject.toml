@@ -35,9 +35,20 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
-# RUF001-003 flag "ambiguous" Unicode punctuation. Matching the typographic
-# apostrophe and em dash is deliberate here: real posts contain "we're" with a
-# curly quote far more often than a straight one, and the claim regexes have to
-# catch both. E501 is covered by the formatter.
-ignore = ["E501", "RUF001", "RUF002", "RUF003"]
+# BLE, N and S are enabled deliberately: the code suppresses specific instances
+# of each (a failing source must never kill the run; urlopen targets are source
+# constants; stdlib handler overrides keep their own naming). Enabling them is
+# what makes those `noqa` markers meaningful instead of dead comments.
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE", "N", "S"]
+ignore = [
+  "E501",                        # long lines are the formatter's business
+  "RUF001", "RUF002", "RUF003",  # typographic punctuation in the regexes is deliberate
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert, bind throwaway names, and monkeypatch module attributes by
+# design; and their fixture strings are not real credentials.
+"tests/*" = [
+  "S101", "S105", "S106", "S311", "S310", "N802",
+  "RUF059", "RUF005", "BLE001", "E402",
+]

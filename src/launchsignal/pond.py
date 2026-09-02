@@ -207,7 +207,7 @@ def run_action(action: str, payload: dict[str, Any]) -> dict[str, Any]:
 class Handler(BaseHTTPRequestHandler):
     server_version = f"LaunchSignal/{__version__}"
 
-    def log_message(self, fmt: str, *args) -> None:  # noqa: A003
+    def log_message(self, fmt: str, *args) -> None:
         LOGGER.info("%s %s", self.address_string(), fmt % args)
 
     # ------------------------------------------------------------------ replies
@@ -226,7 +226,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # -------------------------------------------------------------------- verbs
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path == "/manifest":
             self._send(HTTPStatus.OK, MANIFEST)
@@ -246,7 +246,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._error(HTTPStatus.NOT_FOUND, "not_found", "Unknown endpoint.")
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         path = self.path.split("?", 1)[0].rstrip("/")
         if path != "/runs":
             self._error(HTTPStatus.NOT_FOUND, "not_found", "Unknown endpoint.")
@@ -284,7 +284,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self._send(HTTPStatus.OK, {"status": "succeeded", "action": action,
                                            "result": run_action(action, payload)})
-            except Exception as error:  # noqa: BLE001
+            except Exception as error:
                 LOGGER.exception("action %s failed", action)
                 self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "action_failed", type(error).__name__)
             return
@@ -308,7 +308,7 @@ def _execute(task_id: str, action: str, payload: dict[str, Any]) -> None:
     started = time.monotonic()
     try:
         result = run_action(action, payload)
-    except Exception as error:  # noqa: BLE001
+    except Exception as error:
         LOGGER.exception("async action %s failed", action)
         REGISTRY.finish(task_id, "failed", {"error": type(error).__name__})
         return
@@ -331,7 +331,7 @@ def _execute(task_id: str, action: str, payload: dict[str, Any]) -> None:
     REGISTRY.finish(task_id, "succeeded", result)
 
 
-def serve(host: str = "0.0.0.0", port: int = 8080) -> None:
+def serve(host: str = "0.0.0.0", port: int = 8080) -> None:  # noqa: S104
     if not _access_key():
         LOGGER.warning(
             "POND_ACCESS_KEY is not set: /manifest and /healthz stay public, but "
