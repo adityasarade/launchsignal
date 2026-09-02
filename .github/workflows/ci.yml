@@ -46,10 +46,17 @@ jobs:
 
       # A committed bot token would be a submission-ending mistake, so the
       # shapes are checked explicitly rather than trusted to .gitignore.
+      # Matched against the real token shapes, not the prefix alone: a Slack
+      # bot token is xoxb-<digits>-<digits>-<long secret>, so the documented
+      # "xoxb-your-token-here" placeholder in .env.example is not a match.
       - name: Scan for credential shapes
         run: |
-          if git grep -nIE 'xox[bpasr]-[A-Za-z0-9-]{10,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}' \
-               -- . ':(exclude).github/workflows/ci.yml'; then
+          PATTERN='xox[bpasr]-[0-9]{8,}-[0-9]{8,}-[A-Za-z0-9]{16,}'
+          PATTERN="$PATTERN|xapp-[0-9]-[A-Z0-9]{8,}-[0-9]{8,}-[a-f0-9]{32,}"
+          PATTERN="$PATTERN|gh[pousr]_[A-Za-z0-9]{36,}"
+          PATTERN="$PATTERN|AKIA[0-9A-Z]{16}"
+          PATTERN="$PATTERN|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+          if git grep -nIE "$PATTERN" -- . ':(exclude).github/workflows/ci.yml'; then
             echo "::error::A credential-shaped string is present in the repository."
             exit 1
           fi
