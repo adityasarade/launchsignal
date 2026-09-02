@@ -236,7 +236,7 @@ starting a second scan. Auth **fails closed**: with no `POND_ACCESS_KEY` set,
 ## Tests
 
 ```bash
-make test        # 168 tests, no network access
+make test        # 172 tests, no network access
 ```
 
 Every test maps to a behaviour that matters: the baseline is silent, an
