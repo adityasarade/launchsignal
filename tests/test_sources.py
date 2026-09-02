@@ -496,3 +496,35 @@ class ConfigurableDirectoryTest(unittest.TestCase):
         finally:
             sources.get_text = original
         self.assertEqual([i.company_name for i in items], ["Gamma"])
+
+
+class BriefExamplePostTest(unittest.TestCase):
+    """The URL the brief gives as its worked example of an early founder post.
+
+    Its text cannot be fetched without an authenticated X session, so what is
+    asserted here is what can be asserted honestly: the pipeline accepts this
+    exact URL as a candidate, pins it to a stable identity, and would not treat
+    it as an official announcement.
+    """
+
+    URL = "https://x.com/beknabdik/status/2061493360150601738"
+
+    def test_the_example_url_is_accepted_as_a_candidate(self) -> None:
+        self.assertTrue(sources.is_allowed_public_url(Source.X, self.URL))
+
+    def test_its_identity_is_the_post_id_not_the_url(self) -> None:
+        self.assertEqual(sources._canonical_id(self.URL), "x:2061493360150601738")
+
+    def test_tracking_parameters_do_not_duplicate_it(self) -> None:
+        self.assertEqual(
+            sources._canonical_id(self.URL),
+            sources._canonical_id(self.URL + "?s=20&t=abc"),
+        )
+
+    def test_it_is_not_mistaken_for_an_official_yc_announcement(self) -> None:
+        """A founder's own post must never satisfy the official-account check."""
+        self.assertFalse(
+            sources.is_allowed_public_url(
+                Source.OFFICIAL_X, self.URL, ("ycombinator",)
+            )
+        )
