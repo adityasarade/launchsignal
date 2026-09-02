@@ -19,6 +19,9 @@ def utcnow() -> datetime:
 class Source(StrEnum):
     YC_DIRECTORY = "yc_directory"
     A16Z_SPEEDRUN = "a16z_speedrun"
+    #: A directory supplied by configuration, for a programme page whose URL
+    #: the operator provides at run time.
+    CUSTOM_DIRECTORY = "custom_directory"
     X = "x"
     LINKEDIN = "linkedin"
     LINKEDIN_COMPANY = "linkedin_company"
@@ -56,6 +59,7 @@ class SourceCategory(StrEnum):
 SOURCE_CATEGORIES: dict[Source, SourceCategory] = {
     Source.YC_DIRECTORY: SourceCategory.DIRECTORY,
     Source.A16Z_SPEEDRUN: SourceCategory.DIRECTORY,
+    Source.CUSTOM_DIRECTORY: SourceCategory.DIRECTORY,
     Source.X: SourceCategory.SOCIAL,
     Source.LINKEDIN: SourceCategory.SOCIAL,
     Source.LINKEDIN_COMPANY: SourceCategory.COMPANY_PAGE,
@@ -83,6 +87,7 @@ OFFICIAL_SOURCES = frozenset(
 SOURCE_LABELS = {
     Source.YC_DIRECTORY: "YC Directory",
     Source.A16Z_SPEEDRUN: "a16z Speedrun Directory",
+    Source.CUSTOM_DIRECTORY: "Configured programme directory",
     Source.X: "X (Twitter)",
     Source.LINKEDIN: "LinkedIn",
     Source.LINKEDIN_COMPANY: "LinkedIn (company page)",
@@ -98,6 +103,10 @@ class SignalKind(StrEnum):
     EARLY_FOUNDER_CLAIM = "early_founder_claim"
     #: A LinkedIn company page for a programme company was seen for the first time.
     COMPANY_PAGE_FIRST_SEEN = "company_page_first_seen"
+    #: Affiliation phrasing only ("backed by Y Combinator"). The brief names it
+    #: as a keyword, but it does not evidence a *new* acceptance, so it is
+    #: alerted as a distinctly weaker signal rather than as a scoop.
+    AFFILIATION_MENTION = "affiliation_mention"
     #: Matched a claim pattern but no company could be resolved. Goes to review.
     NEEDS_REVIEW = "needs_review"
     NONE = "none"

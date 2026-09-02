@@ -340,6 +340,109 @@ def _handle_from_url(value: object) -> str | None:
     return f"@{path}" if path and "/" not in path else None
 
 
+class ConfigurableDirectorySource:
+    """A directory adapter pointed at a URL supplied by configuration.
+
+    The brief asks for a "YC Speedrun page" and describes it as YC's own
+    sub-programme, but gives no URL. No such YC directory is public: YC's
+    /speedrun path returns 404 and its company directory contains no reference
+    to Speedrun. Speedrun is a16z's accelerator, which `A16zSpeedrunSource`
+    reads and labels accordingly.
+
+    This adapter closes the gap without guessing. Point
+    LAUNCHSIGNAL_DIRECTORY_URL at any sitemap, JSON list, or JSON API and it is
+    monitored and tagged under LAUNCHSIGNAL_DIRECTORY_PROGRAMME, with no code
+    change. If the intended page turns out to be somewhere else, it is one
+    environment variable away.
+    """
+
+    name = Source.CUSTOM_DIRECTORY
+
+    def __init__(self, url: str | None = None, programme: str | None = None) -> None:
+        self.url = url or os.environ.get("LAUNCHSIGNAL_DIRECTORY_URL", "").strip()
+        self.programme = (
+            programme
+            or os.environ.get("LAUNCHSIGNAL_DIRECTORY_PROGRAMME", "").strip()
+            or "Speedrun"
+        )
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.url)
+
+    def scan(self, store=None) -> Iterator[Evidence]:
+        if not self.url:
+            return
+        body, response = get_text(self.url, source=self.name.value)
+        stripped = body.lstrip()
+        if stripped.startswith("<"):
+            yield from self._from_sitemap(body)
+        else:
+            yield from self._from_json(body)
+        if store is not None:
+            store.set_etag(self.name.value, response.etag)
+
+    def _from_sitemap(self, body: str) -> Iterator[Evidence]:
+        host = urllib.parse.urlsplit(self.url).netloc
+        pattern = re.compile(rf"^https?://{re.escape(host)}/.+/([\w-]+)/?$")
+        for slug, url, lastmod in _parse_sitemap(body, pattern, self.name.value):
+            yield Evidence(
+                source=self.name,
+                external_id=slug,
+                url=url,
+                title=_titleise(slug),
+                excerpt="",
+                company_name=_titleise(slug),
+                programme=self.programme,
+                profile_url=url,
+                metadata={"slug": slug, "lastmod": lastmod, "directory": self.url},
+            )
+
+    def _from_json(self, body: str) -> Iterator[Evidence]:
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as error:
+            raise SourceError(
+                self.name.value,
+                f"{_safe_label(self.url)} is neither XML nor JSON: {error}",
+            ) from None
+        records = payload
+        if isinstance(payload, dict):
+            for key in ("results", "companies", "data", "items"):
+                if isinstance(payload.get(key), list):
+                    records = payload[key]
+                    break
+        if not isinstance(records, list):
+            raise SourceError(self.name.value, "no list of records found in the response")
+        for index, record in enumerate(records):
+            if not isinstance(record, dict):
+                continue
+            name = str(
+                record.get("name") or record.get("company") or record.get("title") or ""
+            ).strip()
+            if not name:
+                continue
+            identifier = str(
+                record.get("id") or record.get("slug") or record.get("uuid") or f"{index}:{name}"
+            )
+            yield Evidence(
+                source=self.name,
+                external_id=identifier,
+                url=str(record.get("url") or record.get("website_url") or self.url),
+                title=name,
+                excerpt=str(record.get("description") or record.get("one_liner") or ""),
+                company_name=name,
+                programme=self.programme,
+                batch=str(record.get("batch") or record.get("cohort") or "") or None,
+                metadata={"directory": self.url},
+            )
+
+
+def _safe_label(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    return f"{parsed.netloc}{parsed.path}"
+
+
 # ----------------------------------------------------- public-index discovery
 
 
@@ -607,7 +710,12 @@ def official_sources() -> list[TinyfishSearchSource]:
 
 
 def directory_sources() -> list[SourceAdapter]:
-    return [YcSitemapSource(), A16zSpeedrunSource()]
+    """The directory adapters, plus any operator-supplied one."""
+    adapters: list[SourceAdapter] = [YcSitemapSource(), A16zSpeedrunSource()]
+    custom = ConfigurableDirectorySource()
+    if custom.configured:
+        adapters.append(custom)
+    return adapters
 
 
 def all_scan_sources(*, recency_minutes: int | None = None) -> list[SourceAdapter]:

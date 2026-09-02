@@ -391,3 +391,108 @@ class ExcludedSlugTest(unittest.TestCase):
         finally:
             sources.get_text = original
         self.assertEqual([i.external_id for i in items], ["ticket-wallet"])
+
+
+class ConfigurableDirectoryTest(unittest.TestCase):
+    """The brief asks for a "YC Speedrun page" but supplies no URL.
+
+    No such YC directory is public, so the operator can point this adapter at
+    whatever page was meant without a code change.
+    """
+
+    def test_unconfigured_adapter_is_not_registered(self) -> None:
+        import os
+
+        previous = os.environ.pop("LAUNCHSIGNAL_DIRECTORY_URL", None)
+        try:
+            names = [s.name for s in sources.directory_sources()]
+            self.assertNotIn(Source.CUSTOM_DIRECTORY, names)
+        finally:
+            if previous:
+                os.environ["LAUNCHSIGNAL_DIRECTORY_URL"] = previous
+
+    def test_configured_adapter_joins_the_scan(self) -> None:
+        import os
+
+        os.environ["LAUNCHSIGNAL_DIRECTORY_URL"] = "https://example.com/companies"
+        try:
+            names = [s.name for s in sources.directory_sources()]
+            self.assertIn(Source.CUSTOM_DIRECTORY, names)
+        finally:
+            del os.environ["LAUNCHSIGNAL_DIRECTORY_URL"]
+
+    def test_reads_a_json_list_of_companies(self) -> None:
+        payload = (
+            '{"results": [{"name": "Alpha", "slug": "alpha", '
+            '"description": "Does things", "cohort": "SR009", '
+            '"website_url": "https://alpha.example"}]}'
+        )
+        original = sources.get_text
+        sources.get_text = lambda *a, **k: (payload, type("R", (), {"etag": None})())
+        try:
+            items = list(
+                sources.ConfigurableDirectorySource(
+                    "https://example.com/api", "YC Speedrun"
+                ).scan(None)
+            )
+        finally:
+            sources.get_text = original
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].company_name, "Alpha")
+        self.assertEqual(items[0].programme, "YC Speedrun")
+        self.assertEqual(items[0].batch, "SR009")
+
+    def test_reads_a_bare_json_array(self) -> None:
+        original = sources.get_text
+        sources.get_text = lambda *a, **k: (
+            '[{"company": "Beta", "id": "b1"}]',
+            type("R", (), {"etag": None})(),
+        )
+        try:
+            items = list(
+                sources.ConfigurableDirectorySource("https://example.com/x").scan(None)
+            )
+        finally:
+            sources.get_text = original
+        self.assertEqual(items[0].company_name, "Beta")
+
+    def test_reads_a_sitemap(self) -> None:
+        sitemap = (
+            '<?xml version="1.0"?><urlset '
+            'xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            "<url><loc>https://example.com/companies/acme</loc></url></urlset>"
+        )
+        original = sources.get_text
+        sources.get_text = lambda *a, **k: (sitemap, type("R", (), {"etag": None})())
+        try:
+            items = list(
+                sources.ConfigurableDirectorySource("https://example.com/sitemap").scan(None)
+            )
+        finally:
+            sources.get_text = original
+        self.assertEqual(items[0].external_id, "acme")
+        self.assertEqual(items[0].company_name, "Acme")
+
+    def test_unparseable_body_is_a_named_error(self) -> None:
+        original = sources.get_text
+        sources.get_text = lambda *a, **k: ("not xml or json", type("R", (), {"etag": None})())
+        try:
+            with self.assertRaises(SourceError) as caught:
+                list(sources.ConfigurableDirectorySource("https://example.com/x").scan(None))
+        finally:
+            sources.get_text = original
+        self.assertIn("neither XML nor JSON", str(caught.exception))
+
+    def test_records_without_a_name_are_skipped(self) -> None:
+        original = sources.get_text
+        sources.get_text = lambda *a, **k: (
+            '[{"id": "1"}, {"name": "Gamma", "id": "2"}]',
+            type("R", (), {"etag": None})(),
+        )
+        try:
+            items = list(
+                sources.ConfigurableDirectorySource("https://example.com/x").scan(None)
+            )
+        finally:
+            sources.get_text = original
+        self.assertEqual([i.company_name for i in items], ["Gamma"])

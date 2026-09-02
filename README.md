@@ -79,11 +79,36 @@ channel ID keeps the scope set minimal.
 | **YC directory** | Public `/companies/sitemap` with a conditional `If-None-Match` request, then one profile fetch per *newly listed* company. The silent baseline skips enrichment, so installing costs one request rather than 6,000 | Company, canonical name, **batch**, description, profile URL |
 | **a16z Speedrun** | Public company API with correct pagination | Company, **cohort** (`SR003`), description, founder, X/LinkedIn handles, profile URL |
 | **X** | Public web search restricted to canonical `x.com/…/status/…` URLs | Founder acceptance posts |
+| **Configured directory** | Optional. Any sitemap or JSON list you point `LAUNCHSIGNAL_DIRECTORY_URL` at | Companies, tagged under your programme label |
 | **LinkedIn (posts)** | Public web search restricted to canonical `/posts/…` URLs | Founder acceptance posts |
 | **LinkedIn (company pages)** | Separate query family restricted to `/company/…` URLs | Company pages *first observed* |
 
-Speedrun is **a16z's** programme, not YC's. It is labelled `a16z Speedrun`
-everywhere — in the enum, the database, and every alert.
+### A note on the "YC Speedrun page"
+
+The brief asks for "YC's dedicated Speedrun program directory" and supplies no
+URL. I could not find one, and checked before assuming:
+
+- `https://www.ycombinator.com/speedrun` returns **404**.
+- The YC company directory contains **zero** references to Speedrun, and offers
+  no Speedrun batch facet.
+- Speedrun is **a16z's** accelerator — `speedrun.a16z.com` — with its own
+  public company API.
+
+So this monitors the real, public Speedrun directory, tagged separately from YC
+as the brief requires, and labels it `a16z Speedrun` honestly rather than
+presenting a16z's programme as YC's.
+
+**If a different page was meant, it needs no code change.** Point the
+configurable directory adapter at it:
+
+```dotenv
+LAUNCHSIGNAL_DIRECTORY_URL=https://example.com/speedrun/companies
+LAUNCHSIGNAL_DIRECTORY_PROGRAMME=YC Speedrun
+```
+
+It accepts a sitemap, a JSON array, or a JSON API (`results` / `companies` /
+`data` / `items`), and the source joins the scan tagged under that programme
+name. Say the word and it is one line of config.
 
 ### What the social sources do and do not do
 
@@ -107,6 +132,14 @@ directory_membership  the company appears in a public directory
 official_x            a configured official X account has posted about it
 official_linkedin     a configured official LinkedIn page has posted about it
 ```
+
+### Signal strength is never overstated
+
+The brief names `"YC S26"`, `"Speedrun batch"` and `"backed by Y Combinator"` as
+keywords. All three are detected — but they are not equal evidence. "Backed by
+Y Combinator" is true of every alumnus forever, so a post containing only that
+is surfaced as `🔎 YC MENTION — affiliation only`, not as an acceptance scoop.
+An actual acceptance statement outranks it.
 
 An alert is labelled **“Founder Announced Before YC”** only when official
 accounts were genuinely checked, returned at least one snapshot, and did not
@@ -167,7 +200,23 @@ Classification keys off the *category*, never the source identity, so the
 classifier, store and Slack renderer need no changes. There is a test that
 holds this line (`ExtensibilityTest`).
 
+## Delivering to a channel *or* a DM
+
+`SLACK_CHANNEL_ID` accepts either:
+
+- a channel ID (`C…`) — invite the bot with `/invite @YourAppName`; needs only
+  `chat:write`;
+- your own user ID (`U…`) for a direct message — add the `im:write` scope so the
+  bot may open the conversation.
+
+`launchsignal doctor` validates whichever you choose before anything is sent.
+
 ## Pond Protocol V1
+
+The brief asks that the bot be able to run on Pond's agent infrastructure for
+review and health monitoring (<https://joinpond.ai/agent/create>). The control
+plane below implements that contract and is contract-tested over real HTTP; it
+needs only a public HTTPS URL to publish.
 
 ```bash
 POND_ACCESS_KEY=... launchsignal pond
@@ -187,7 +236,7 @@ starting a second scan. Auth **fails closed**: with no `POND_ACCESS_KEY` set,
 ## Tests
 
 ```bash
-make test        # 157 tests, no network access
+make test        # 168 tests, no network access
 ```
 
 Every test maps to a behaviour that matters: the baseline is silent, an

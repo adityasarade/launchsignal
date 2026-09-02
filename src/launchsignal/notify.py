@@ -183,6 +183,8 @@ def headline(alert: Alert) -> str:
         return "FOUNDER CLAIM — unverified (no official check configured)"
     if alert.kind is SignalKind.COMPANY_PAGE_FIRST_SEEN:
         return "LINKEDIN COMPANY PAGE — first observed"
+    if alert.kind is SignalKind.AFFILIATION_MENTION:
+        return f"{alert.programme.upper()} MENTION — affiliation only"
     return f"NEW {alert.programme.upper()} COMPANY"
 
 
@@ -191,6 +193,8 @@ def emoji(alert: Alert) -> str:
         return "🚨" if alert.official.state is OfficialState.NOT_SEEN else "📣"
     if alert.kind is SignalKind.COMPANY_PAGE_FIRST_SEEN:
         return "🏢"
+    if alert.kind is SignalKind.AFFILIATION_MENTION:
+        return "🔎"
     return "✅"
 
 
@@ -203,6 +207,11 @@ def status_line(alert: Alert) -> str:
         if alert.official.state is OfficialState.SEEN:
             return f"Founder-announced — {alert.official.describe()}"
         return f"Founder-announced — {alert.official.describe()}"
+    if alert.kind is SignalKind.AFFILIATION_MENTION:
+        return (
+            "Post states a programme affiliation but not a new acceptance, so this "
+            "is a weaker signal than an acceptance announcement"
+        )
     return f"Company page first observed via public search — {alert.official.describe()}"
 
 

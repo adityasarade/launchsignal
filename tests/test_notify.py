@@ -156,3 +156,27 @@ class HeadlineHonestyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AffiliationAlertTest(unittest.TestCase):
+    """"backed by Y Combinator" is reported without overstating it."""
+
+    def card(self):
+        return alert(
+            kind=SignalKind.AFFILIATION_MENTION,
+            excerpt="We are backed by Y Combinator.",
+            official=OfficialCheck(state=OfficialState.NOT_CHECKED),
+        )
+
+    def test_headline_does_not_claim_a_new_acceptance(self) -> None:
+        text = headline(self.card())
+        self.assertIn("affiliation only", text)
+        self.assertNotIn("Announced Before YC", text)
+
+    def test_status_explains_why_it_is_weaker(self) -> None:
+        self.assertIn("not a new acceptance", status_line(self.card()))
+
+    def test_card_still_renders_every_required_field(self) -> None:
+        text = rendered(build_blocks(self.card()))
+        for expected in ("*Company:*", "*Source:*", "Original post", "Detected"):
+            self.assertIn(expected, text)

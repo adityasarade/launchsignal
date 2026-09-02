@@ -47,11 +47,26 @@ class ClaimDetectionTest(unittest.TestCase):
             SignalKind.EARLY_FOUNDER_CLAIM,
         )
 
-    def test_backed_by_is_not_a_new_acceptance(self) -> None:
-        """'Backed by YC' is true of every alumnus forever and is not news."""
+    def test_backed_by_is_detected_but_marked_as_the_weaker_signal(self) -> None:
+        """The brief names "backed by Y Combinator" as a keyword to detect.
+
+        On its own it is poor evidence of a *new* acceptance -- it is true of
+        every alumnus forever -- so it is surfaced as an affiliation mention
+        rather than as an acceptance scoop. Detected, but not overstated.
+        """
+        for text in (
+            "We are backed by Y Combinator and Sequoia.",
+            "Proud to be a YC-backed company.",
+            "Our YC company is hiring.",
+        ):
+            self.assertEqual(
+                claim_kind(post(text)), SignalKind.AFFILIATION_MENTION, text
+            )
+
+    def test_an_acceptance_outranks_a_bare_affiliation(self) -> None:
         self.assertEqual(
-            claim_kind(post("We are backed by Y Combinator and Sequoia.")),
-            SignalKind.NONE,
+            claim_kind(post("We got into YC S26 and are backed by Y Combinator.")),
+            SignalKind.EARLY_FOUNDER_CLAIM,
         )
 
     def test_unrelated_post_is_not_a_claim(self) -> None:

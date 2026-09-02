@@ -29,8 +29,8 @@ from .models import (
 
 # --------------------------------------------------------------- claim detection
 
-#: A first-person acceptance statement. "backed by" is deliberately excluded:
-#: it is true of every YC alumnus forever and says nothing about a new batch.
+#: A first-person acceptance statement -- the strong signal. Weaker
+#: affiliation phrasing is handled separately by _AFFILIATION below.
 _ACCEPTANCE = re.compile(
     r"""(?ix)
     \b(?:
@@ -51,6 +51,21 @@ _BATCH = re.compile(
     r"( (?: [swf] | summer | winter | fall | spring ) \s* \d{2,4} ) \b"
 )
 _BATCH_SHORT = re.compile(r"(?i)\byc\s*([swf]\d{2})\b")
+
+#: Weaker affiliation phrasing. "backed by Y Combinator" is true of every
+#: alumnus forever, so on its own it is poor evidence of a *new* acceptance --
+#: but the brief names it explicitly as a keyword to detect, so it is matched
+#: and the alert is marked as the weaker signal rather than dropped. Per-company
+#: deduplication means a long-standing alumnus can only ever alert once.
+_AFFILIATION = re.compile(
+    r"""(?ix)
+    \b(?:
+        backed \s+ by \s+ (?:yc|y \s* combinator)
+      | (?:yc|y \s* combinator) \s* [-\u2013] \s* backed
+      | (?:yc|y \s* combinator) \s+ (?:company|startup|founder)
+    )\b
+    """
+)
 
 _SPEEDRUN_CLAIM = re.compile(
     r"""(?ix)
@@ -269,8 +284,11 @@ def resolve_programme(evidence: Evidence) -> str:
         return evidence.programme
     if _SPEEDRUN_CLAIM.search(evidence.text):
         return PROGRAMME_SPEEDRUN
-    if _ACCEPTANCE.search(evidence.text) or _BATCH.search(evidence.text) or _BATCH_SHORT.search(
-        evidence.text
+    if (
+        _ACCEPTANCE.search(evidence.text)
+        or _BATCH.search(evidence.text)
+        or _BATCH_SHORT.search(evidence.text)
+        or _AFFILIATION.search(evidence.text)
     ):
         return PROGRAMME_YC
     return evidence.programme
@@ -290,6 +308,8 @@ def claim_kind(evidence: Evidence) -> SignalKind:
         return SignalKind.EARLY_FOUNDER_CLAIM
     if _BATCH_SHORT.search(text) or _BATCH.search(text):
         return SignalKind.EARLY_FOUNDER_CLAIM
+    if _AFFILIATION.search(text):
+        return SignalKind.AFFILIATION_MENTION
     return SignalKind.NONE
 
 
