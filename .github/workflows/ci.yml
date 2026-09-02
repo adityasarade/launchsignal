@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: pip install -e .
+
+      # The suite must pass with no secrets present: every source is stubbed
+      # and no test touches the network.
+      - name: Test
+        run: PYTHONPATH=src:tests python -m unittest discover -s tests -v
+
+      - name: Lint
+        run: pipx install ruff && ruff check src tests
+
+      - name: Setup check runs without credentials
+        run: launchsignal doctor || true
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # A committed bot token would be a submission-ending mistake, so the
+      # shapes are checked explicitly rather than trusted to .gitignore.
+      - name: Scan for credential shapes
+        run: |
+          if git grep -nIE 'xox[bpasr]-[A-Za-z0-9-]{10,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}' \
+               -- . ':(exclude).github/workflows/ci.yml'; then
+            echo "::error::A credential-shaped string is present in the repository."
+            exit 1
+          fi
+          echo "No credential shapes found."
+
+      - name: Ensure .env is ignored and absent
+        run: |
+          test ! -f .env || { echo "::error::.env is committed"; exit 1; }
+          grep -qx '.env' .gitignore || { echo "::error::.env is not gitignored"; exit 1; }
+          echo ".env is ignored and absent."

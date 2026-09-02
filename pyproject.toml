@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "launchsignal"
+version = "1.0.0"
+description = "Stateful public-source YC and a16z Speedrun launch monitor for Slack"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Aditya Sarade" }]
+keywords = ["yc", "ycombinator", "speedrun", "slack", "monitoring", "gtm"]
+classifiers = [
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Office/Business",
+]
+# No third-party dependencies. The standard library covers HTTP, SQLite, the
+# .env reader and the Pond control plane, which keeps setup to one command.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/adityasarade/launchsignal"
+Issues = "https://github.com/adityasarade/launchsignal/issues"
+
+[project.scripts]
+launchsignal = "launchsignal.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]

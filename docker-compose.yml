@@ -1,0 +1,23 @@
+# One command to run the whole thing:
+#   cp .env.example .env   (fill in the Slack values)
+#   docker compose up monitor
+services:
+  monitor:
+    build: .
+    env_file: [.env]
+    volumes: ["launchsignal-data:/data"]
+    restart: unless-stopped
+    command: ["serve"]
+
+  # Optional: the Pond Protocol V1 control plane.
+  #   docker compose up pond
+  pond:
+    build: .
+    env_file: [.env]
+    volumes: ["launchsignal-data:/data"]
+    restart: unless-stopped
+    ports: ["8080:8080"]
+    command: ["pond"]
+
+volumes:
+  launchsignal-data:
