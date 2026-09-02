@@ -76,7 +76,7 @@ channel ID keeps the scope set minimal.
 
 | Source | How it is read | What it yields |
 | --- | --- | --- |
-| **YC directory** | Public `/companies/sitemap` with a conditional `If-None-Match` request, then one profile fetch per *newly listed* company | Company, canonical name, **batch**, description, profile URL |
+| **YC directory** | Public `/companies/sitemap` with a conditional `If-None-Match` request, then one profile fetch per *newly listed* company. The silent baseline skips enrichment, so installing costs one request rather than 6,000 | Company, canonical name, **batch**, description, profile URL |
 | **a16z Speedrun** | Public company API with correct pagination | Company, **cohort** (`SR003`), description, founder, X/LinkedIn handles, profile URL |
 | **X** | Public web search restricted to canonical `x.com/…/status/…` URLs | Founder acceptance posts |
 | **LinkedIn (posts)** | Public web search restricted to canonical `/posts/…` URLs | Founder acceptance posts |
@@ -109,9 +109,16 @@ official_linkedin     a configured official LinkedIn page has posted about it
 ```
 
 An alert is labelled **“Founder Announced Before YC”** only when official
-accounts were genuinely checked and did not mention the company. If no
-official-snapshot source is configured, the same claim is reported as
-**“FOUNDER CLAIM — unverified (no official check configured)”**.
+accounts were genuinely checked, returned at least one snapshot, and did not
+mention the company. If no official-snapshot source is configured — or the
+search ran but returned nothing usable — the same claim is reported as
+**“FOUNDER CLAIM — unverified”**, with the reason spelled out.
+
+The two programmes are compared separately. A claim about a YC batch is only
+ever checked against YC's own accounts, so an a16z post about a similarly named
+company cannot suppress it. The programme itself is read from the claim text,
+not assumed: a post saying “we joined a16z Speedrun SR004” alerts as
+`a16z Speedrun`, with its own company key.
 
 That distinction is the point. “I checked nothing and found nothing” is not
 evidence that a programme has stayed quiet, so the card never says it is. Every
@@ -135,9 +142,17 @@ company.
   exists and alerts nothing. It is tracked per source, so adding a source later
   does not mute the others, and a source that fails mid-baseline is not marked
   seeded.
-- **Staged delivery.** The alert row is written *before* the Slack call. If the
-  send fails or the process dies, the next scan retries it. Sends are paced to
-  Slack's rate limit and `429` is honoured.
+- **Atomic delivery claim.** The alert row is written *before* the Slack call,
+  and the write itself is the claim: exactly one caller can create a given
+  `alert_key`, so two sources in one scan — or two concurrent scans — cannot
+  both send. Retries take an equally atomic lease. Sends are paced to Slack's
+  rate limit and `429` is honoured.
+- **Dead-lettering.** A transient failure is retried on later scans. A fatal one
+  (`channel_not_found`, `invalid_auth`) is recorded as dead immediately and
+  shown by `launchsignal health`, rather than retried until an attempt budget
+  quietly runs out.
+- **One scan at a time.** The scheduler and the Pond control plane share a
+  database-backed lock, so they cannot overlap and double-deliver.
 - **Review queue.** If no company can be resolved from a post, it goes to
   `launchsignal review` — the monitor never invents a name to fill a card.
 
@@ -172,14 +187,22 @@ starting a second scan. Auth **fails closed**: with no `POND_ACCESS_KEY` set,
 ## Tests
 
 ```bash
-make test        # 113 tests, no network access
+make test        # 151 tests, no network access
 ```
 
 Every test maps to a behaviour that matters: the baseline is silent, an
 identical rescan sends nothing, a directory listing does not suppress a later
-founder claim, a failed Slack send is retried rather than lost, one failing
-source does not stop the others, an unchecked claim is never presented as a
-scoop, and `Arc` does not match `Arcade`.
+founder claim, a failed Slack send is retried rather than lost, a *fatal* one
+is not retried forever, exactly one caller can claim an alert under concurrency,
+one failing source does not stop the others, a Speedrun post is never labelled
+YC, an unchecked claim is never presented as a scoop, and `Arc` does not match
+`Arcade`.
+
+Verified live against the real sources: a baseline of 6,462 records
+(6,204 YC + 258 a16z Speedrun) in ~5s with zero alerts, an identical rescan
+producing zero new records and zero alerts, and newly listed companies alerting
+with a real batch and description pulled from their profile pages
+(`ReactWise — YC S24 — AI Co-Pilot for Chemical Process Optimization`).
 
 ## Cost
 

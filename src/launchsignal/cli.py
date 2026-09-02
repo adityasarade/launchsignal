@@ -82,6 +82,25 @@ def scan_once(store: Store, notifier: SlackNotifier, *, fast: bool = False) -> d
     return result
 
 
+def _locked_scan(store: Store, notifier: SlackNotifier, *, fast: bool) -> dict:
+    """Run a scan under the shared lock.
+
+    The scheduler and the Pond control plane can both be pointed at one
+    database. Without a shared lock two scans overlap, each claiming and
+    delivering alerts with its own Slack throttle.
+    """
+    from .pond import SCAN_LOCK
+
+    holder = store.acquire_lock(SCAN_LOCK, ttl_seconds=3600)
+    if holder is None:
+        LOGGER.info("skipping: another scan is already running")
+        return {"outcome": "skipped", "reason": "another scan is already running"}
+    try:
+        return scan_once(store, notifier, fast=fast)
+    finally:
+        store.release_lock(SCAN_LOCK, holder)
+
+
 def _print(payload: object) -> None:
     print(json.dumps(payload, indent=2, default=str))
 
@@ -176,11 +195,12 @@ def cmd_serve(args) -> int:
             try:
                 if now >= next_full:
                     LOGGER.info("full scan starting")
-                    LOGGER.info("full scan: %s", json.dumps(scan_once(store, notifier), default=str))
+                    LOGGER.info("full scan: %s", json.dumps(
+                        _locked_scan(store, notifier, fast=False), default=str))
                     next_full = time.monotonic() + full_interval * 60
                 elif fast_interval and now >= next_fast:
                     LOGGER.info("fast lane: %s", json.dumps(
-                        scan_once(store, notifier, fast=True), default=str))
+                        _locked_scan(store, notifier, fast=True), default=str))
                     next_fast = time.monotonic() + fast_interval * 60
             except SlackConfigError as error:
                 # Misconfiguration is not transient; stop rather than spin.

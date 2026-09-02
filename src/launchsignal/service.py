@@ -25,6 +25,7 @@ from .classifier import (
     founder_handle,
     official_check,
     resolve_company,
+    resolve_programme,
 )
 from .http import SourceError
 from .models import (
@@ -67,10 +68,10 @@ class Monitor:
         }
 
         counts["retried"] = self._flush_pending()
-        official, accounts = self._collect_official(official_sources, counts)
+        official = self._collect_official(official_sources, counts)
 
         for source in sources:
-            outcome = self._run_source(source, official, accounts, counts)
+            outcome = self._run_source(source, official, counts)
             counts["sources"].append(vars(outcome))
 
         failures = [s for s in counts["sources"] if not s["ok"]]
@@ -82,8 +83,7 @@ class Monitor:
     def _run_source(
         self,
         source: object,
-        official: list[Evidence],
-        accounts: tuple[str, ...],
+        official: dict[str, tuple[list[Evidence], tuple[str, ...]]],
         counts: dict[str, object],
     ) -> SourceOutcome:
         name = getattr(source, "name", None)
@@ -98,7 +98,7 @@ class Monitor:
             for evidence in source.scan(self.store):
                 outcome.observations += 1
                 counts["observations"] = int(counts["observations"]) + 1
-                if self._ingest(evidence, baseline, official, accounts, counts, outcome):
+                if self._ingest(evidence, baseline, official, counts, outcome):
                     outcome.new += 1
         except SourceError as error:
             # One bad source is reported and skipped. It does not abort the scan,
@@ -126,8 +126,7 @@ class Monitor:
         self,
         evidence: Evidence,
         baseline: bool,
-        official: list[Evidence],
-        accounts: tuple[str, ...],
+        official: dict[str, tuple[list[Evidence], tuple[str, ...]]],
         counts: dict[str, object],
         outcome: SourceOutcome,
     ) -> bool:
@@ -147,14 +146,18 @@ class Monitor:
                 )
             return False
 
-        key = company_key(company, evidence.programme)
+        # The programme is resolved from the claim, not assumed. A social
+        # adapter cannot know it in advance, and defaulting to YC made every
+        # Speedrun post an "EARLY YC SIGNAL" with a YC company key.
+        programme = resolve_programme(evidence)
+        key = company_key(company, programme)
         if not self.store.record_observation(evidence, key):
             return False
         counts["new"] = int(counts["new"]) + 1
         if baseline:
             return True
 
-        alert = self._build_alert(evidence, company, key, official, accounts)
+        alert = self._build_alert(evidence, company, programme, key, official)
         if alert is None:
             return True
         if self._deliver(alert):
@@ -165,9 +168,9 @@ class Monitor:
         self,
         evidence: Evidence,
         company: str,
+        programme: str,
         key: str,
-        official: list[Evidence],
-        accounts: tuple[str, ...],
+        official: dict[str, tuple[list[Evidence], tuple[str, ...]]],
     ) -> Alert | None:
         kind = claim_kind(evidence)
         if kind in {SignalKind.NONE, SignalKind.NEEDS_REVIEW}:
@@ -175,7 +178,11 @@ class Monitor:
         if kind is SignalKind.CONFIRMED:
             check = OfficialCheck(state=OfficialState.NOT_CHECKED)
         else:
-            check = official_check(company, official, accounts, utcnow())
+            # Only this programme's own accounts count. Comparing a YC claim
+            # against a16z's feed lets one programme's post suppress the
+            # other's early signal.
+            snapshots, accounts = official.get(programme, ([], ()))
+            check = official_check(company, snapshots, accounts, utcnow())
         return Alert(
             # Keyed on company AND kind. A directory confirmation and an early
             # founder claim about the same company are different news, so they
@@ -185,7 +192,7 @@ class Monitor:
             company_key=key,
             kind=kind,
             company_name=company,
-            programme=evidence.programme,
+            programme=programme,
             source=evidence.source,
             source_url=evidence.url,
             excerpt=evidence.excerpt,
@@ -199,22 +206,36 @@ class Monitor:
     # --------------------------------------------------------------- delivery
 
     def _deliver(self, alert: Alert) -> bool:
-        """Stage, send, then confirm.
+        """Claim, send, then confirm.
 
-        The alert row is written before the Slack call. If the send fails or the
-        process dies, the row survives in 'pending' and the next scan retries
-        it. Sending first and recording after loses the alert permanently,
-        because by then the observation is already committed and no longer new.
+        The claim is an atomic INSERT, so exactly one caller can own a given
+        alert_key. The row is written before the Slack call: if the send fails
+        or the process dies, the row survives and the next scan retries it.
+        Sending first and recording after loses the alert permanently, because
+        by then the observation is committed and no longer new.
         """
-        if not self.store.stage_alert(alert):
+        if not self.store.claim_alert(alert):
             return False
+        return self._send_claimed(alert)
+
+    def _send_claimed(self, alert: Alert) -> bool:
         try:
             slack_ts = self.notifier.send(alert)
         except SlackConfigError:
             raise
         except SlackSendError as error:
-            self.store.mark_alert_failed(alert.alert_key, error.error_code)
-            LOGGER.error("alert %s not delivered: %s", alert.company_name, error.error_code)
+            # A fatal error cannot be fixed by trying again, so it is recorded
+            # as dead and surfaced in the health report rather than retried on
+            # every scan until the attempt budget quietly runs out.
+            self.store.mark_alert_failed(
+                alert.alert_key, error.error_code, terminal=error.fatal
+            )
+            LOGGER.error(
+                "alert %s not delivered (%s%s)",
+                alert.company_name,
+                error.error_code,
+                "; fatal, will not retry" if error.fatal else "",
+            )
             return False
         self.store.mark_alert_sent(alert.alert_key, slack_ts)
         return True
@@ -225,20 +246,18 @@ class Monitor:
 
         sent = 0
         for row in self.store.pending_alerts():
+            key = str(row["alert_key"])
             try:
                 alert = alert_from_payload(json.loads(str(row["payload_json"])))
             except Exception:  # noqa: BLE001 - a bad row must not block the run
-                LOGGER.warning("skipping unreadable pending alert %s", row["alert_key"])
+                LOGGER.warning("skipping unreadable pending alert %s", key)
                 continue
-            try:
-                slack_ts = self.notifier.send(alert)
-            except SlackConfigError:
-                raise
-            except SlackSendError as error:
-                self.store.mark_alert_failed(alert.alert_key, error.error_code)
+            # Lease it before sending. Without the conditional update two
+            # concurrent retries would both list the row and both send it.
+            if not self.store.claim_pending(key):
                 continue
-            self.store.mark_alert_sent(alert.alert_key, slack_ts)
-            sent += 1
+            if self._send_claimed(alert):
+                sent += 1
         if sent:
             LOGGER.info("re-delivered %d previously staged alert(s)", sent)
         return sent
@@ -247,35 +266,43 @@ class Monitor:
 
     def _collect_official(
         self, official_sources: Iterable[object], counts: dict[str, object]
-    ) -> tuple[list[Evidence], tuple[str, ...]]:
-        """Snapshot official accounts, recording which ones were really read.
+    ) -> dict[str, tuple[list[Evidence], tuple[str, ...]]]:
+        """Snapshot each programme's official accounts, keyed by programme.
 
-        `accounts` is the audit trail. If it comes back empty, every downstream
-        claim is reported as NOT_CHECKED rather than as beating an announcement.
+        The returned accounts tuple is the audit trail printed on the alert. It
+        holds the real handles (@ycombinator), not a source label, and it is
+        scoped per programme so one programme's announcements cannot be used to
+        answer a question about the other.
         """
-        snapshots: list[Evidence] = []
-        accounts: list[str] = []
+        collected: dict[str, tuple[list[Evidence], tuple[str, ...]]] = {}
         for source in official_sources:
             label = getattr(getattr(source, "name", None), "value", str(source))
+            programme = getattr(source, "programme", None) or "YC"
+            handles = tuple(getattr(source, "account_labels", (label,)))
             try:
                 items = list(source.scan(self.store))
             except SourceError as error:
                 LOGGER.warning("official source %s unavailable: %s", label, error.message)
                 counts.setdefault("official_errors", []).append(
-                    {"source": label, "error": error.message}
+                    {"source": label, "programme": programme, "error": error.message}
                 )
                 continue
             except Exception as error:  # noqa: BLE001
                 LOGGER.warning("official source %s raised: %s", label, error)
                 counts.setdefault("official_errors", []).append(
-                    {"source": label, "error": str(error)}
+                    {"source": label, "programme": programme, "error": str(error)}
                 )
                 continue
-            snapshots.extend(items)
-            accounts.append(label)
-        counts["official_snapshots"] = len(snapshots)
-        counts["official_accounts"] = accounts
-        return snapshots, tuple(accounts)
+            snapshots, accounts = collected.get(programme, ([], ()))
+            collected[programme] = (
+                [*snapshots, *items],
+                tuple(dict.fromkeys([*accounts, *handles])),
+            )
+        counts["official"] = {
+            programme: {"snapshots": len(items), "accounts": list(accounts)}
+            for programme, (items, accounts) in collected.items()
+        }
+        return collected
 
 
 def health_report(store: Store, notifier: SlackNotifier) -> dict[str, object]:
@@ -289,6 +316,7 @@ def health_report(store: Store, notifier: SlackNotifier) -> dict[str, object]:
         "observations": store.observation_count(),
         "alerts": store.alert_counts(),
         "pending_alerts": len(store.pending_alerts()),
+        "undelivered_alerts": store.undelivered_alerts(),
         "review_queue": len(store.review_items(limit=1000)),
         "sources": store.source_health(),
         "last_run": {

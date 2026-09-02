@@ -91,26 +91,52 @@ MANIFEST: dict[str, Any] = {
 class TaskRegistry:
     """In-memory async task table with run-id idempotency."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_tasks: int = 500) -> None:
         self._lock = threading.Lock()
         self._tasks: dict[str, dict[str, Any]] = {}
         self._by_run_id: dict[str, str] = {}
+        self.max_tasks = max_tasks
 
-    def existing(self, run_id: str | None) -> dict[str, Any] | None:
-        if not run_id:
-            return None
-        with self._lock:
-            task_id = self._by_run_id.get(run_id)
-            return dict(self._tasks[task_id]) if task_id else None
+    def get_or_create(
+        self, action: str, run_id: str | None
+    ) -> tuple[dict[str, Any], bool]:
+        """Return (task, created).
 
-    def create(self, action: str, run_id: str | None) -> dict[str, Any]:
-        task_id = uuid.uuid4().hex
-        record = {"task_id": task_id, "action": action, "status": "running", "result": None}
+        One critical section covers both the lookup and the insert. Checking
+        first and creating second lets two requests carrying the same run_id
+        both miss, so Pond's idempotency guarantee breaks and the scan runs
+        twice.
+        """
         with self._lock:
+            if run_id and run_id in self._by_run_id:
+                return dict(self._tasks[self._by_run_id[run_id]]), False
+            task_id = uuid.uuid4().hex
+            record = {
+                "task_id": task_id,
+                "action": action,
+                "status": "running",
+                "result": None,
+            }
             self._tasks[task_id] = record
             if run_id:
                 self._by_run_id[run_id] = task_id
-        return dict(record)
+            self._evict_locked()
+            return dict(record), True
+
+    def _evict_locked(self) -> None:
+        """Bound the table so a long-lived server cannot grow without limit."""
+        if len(self._tasks) <= self.max_tasks:
+            return
+        finished = [
+            task_id
+            for task_id, record in self._tasks.items()
+            if record["status"] != "running"
+        ]
+        for task_id in finished[: len(self._tasks) - self.max_tasks]:
+            self._tasks.pop(task_id, None)
+            for run_id, mapped in list(self._by_run_id.items()):
+                if mapped == task_id:
+                    self._by_run_id.pop(run_id, None)
 
     def finish(self, task_id: str, status: str, result: Any) -> None:
         with self._lock:
@@ -137,7 +163,14 @@ def _authorised(header: str | None) -> bool:
         return False
     if not header or not header.startswith("Bearer "):
         return False
-    return hmac.compare_digest(header[7:].strip(), expected)
+    # compare_digest on str is ASCII-only and raises TypeError otherwise, which
+    # would turn a bad credential into an unhandled 500.
+    return hmac.compare_digest(
+        header[7:].strip().encode("utf-8", "replace"), expected.encode("utf-8")
+    )
+
+
+SCAN_LOCK = "scan"
 
 
 def run_action(action: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -150,7 +183,19 @@ def run_action(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         if action == "get_health":
             return health_report(store, notifier)
         if action == "run_scan":
-            return scan_once(store, notifier, fast=bool(payload.get("fast")))
+            # Only one scan may run against a database at a time. Two
+            # concurrent scans each claim and deliver work, and their
+            # independent Slack throttles jointly exceed the rate limit.
+            holder = store.acquire_lock(SCAN_LOCK, ttl_seconds=MAX_EXECUTION_SECONDS)
+            if holder is None:
+                return {
+                    "outcome": "skipped",
+                    "reason": "another scan is already running",
+                }
+            try:
+                return scan_once(store, notifier, fast=bool(payload.get("fast")))
+            finally:
+                store.release_lock(SCAN_LOCK, holder)
         if action == "review_signal":
             limit = int(payload.get("limit") or 50)
             return {"items": store.review_items(limit=max(1, min(limit, 200)))}
@@ -235,12 +280,6 @@ class Handler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_REQUEST, "unknown_action", f"Unknown action: {action or '(none)'}")
             return
 
-        # Idempotency: the same run_id returns the original task, never a rerun.
-        duplicate = REGISTRY.existing(run_id if isinstance(run_id, str) else None)
-        if duplicate is not None:
-            self._send(HTTPStatus.OK, duplicate)
-            return
-
         if known[action]["mode"] == "sync":
             try:
                 self._send(HTTPStatus.OK, {"status": "succeeded", "action": action,
@@ -250,7 +289,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "action_failed", type(error).__name__)
             return
 
-        task = REGISTRY.create(action, run_id if isinstance(run_id, str) else None)
+        task, created = REGISTRY.get_or_create(
+            action, run_id if isinstance(run_id, str) else None
+        )
+        if not created:
+            self._send(HTTPStatus.OK, task)
+            return
         threading.Thread(
             target=_execute, args=(task["task_id"], action, payload), daemon=True
         ).start()
@@ -258,11 +302,33 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _execute(task_id: str, action: str, payload: dict[str, Any]) -> None:
+    """Run an async action, enforcing the limit the manifest advertises."""
+    import time
+
+    started = time.monotonic()
     try:
-        REGISTRY.finish(task_id, "succeeded", run_action(action, payload))
+        result = run_action(action, payload)
     except Exception as error:  # noqa: BLE001
         LOGGER.exception("async action %s failed", action)
         REGISTRY.finish(task_id, "failed", {"error": type(error).__name__})
+        return
+    elapsed = time.monotonic() - started
+    if elapsed > MAX_EXECUTION_SECONDS:
+        # The manifest promises a ceiling, so an overrun is reported rather
+        # than quietly returned as a clean success.
+        LOGGER.error("action %s ran %.0fs, over the advertised limit", action, elapsed)
+        REGISTRY.finish(
+            task_id,
+            "failed",
+            {
+                "error": "execution_limit_exceeded",
+                "elapsed_seconds": round(elapsed, 1),
+                "limit_seconds": MAX_EXECUTION_SECONDS,
+                "partial_result": result,
+            },
+        )
+        return
+    REGISTRY.finish(task_id, "succeeded", result)
 
 
 def serve(host: str = "0.0.0.0", port: int = 8080) -> None:

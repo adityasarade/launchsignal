@@ -17,11 +17,17 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import uuid
+from datetime import timedelta
 from pathlib import Path
 
 from .models import Alert, Evidence, ReviewItem, SignalKind, utcnow
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+#: Deliveries are retried this many times before the alert is reported as
+#: undelivered rather than retried forever.
+MAX_DELIVERY_ATTEMPTS = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -35,9 +41,22 @@ CREATE TABLE IF NOT EXISTS observations (
   excerpt       TEXT NOT NULL,
   observed_at   TEXT NOT NULL,
   metadata_json TEXT NOT NULL,
+  -- Tracked separately from existence. A record can be observed without having
+  -- had its detail page fetched, and it must stay eligible for enrichment
+  -- later: keying enrichment off "is new" means anything skipped by a
+  -- per-cycle cap never gets a batch or a description at all.
+  enriched      INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (source, external_id)
 );
 CREATE INDEX IF NOT EXISTS observations_company ON observations(company_key);
+
+-- Cross-process mutual exclusion. A `serve` loop and a Pond `run_scan` share
+-- one database, and two simultaneous scans would each claim and deliver work.
+CREATE TABLE IF NOT EXISTS locks (
+  name       TEXT PRIMARY KEY,
+  holder     TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
 
 -- An alert row is written BEFORE the Slack call, in state 'pending'. If the
 -- send fails or the process dies, the row survives and the next scan retries
@@ -93,6 +112,11 @@ CREATE TABLE IF NOT EXISTS scan_runs (
 """
 
 
+_MIGRATED_INDEXES = """
+CREATE INDEX IF NOT EXISTS observations_enriched ON observations(source, enriched);
+"""
+
+
 def company_key(company_name: str, programme: str) -> str:
     """Stable cluster id for one company within one programme."""
     from .classifier import canonical_name
@@ -114,15 +138,63 @@ class Store:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA foreign_keys=ON")
+        # Order matters: tables, then additive column migrations, then any
+        # index that depends on a migrated column. Creating that index first
+        # fails outright on a database written by an earlier version.
         self.connection.executescript(_SCHEMA)
+        self._migrate()
+        self.connection.executescript(_MIGRATED_INDEXES)
         self.connection.execute(
             "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",
             (str(SCHEMA_VERSION),),
         )
         self.connection.commit()
 
+    def _migrate(self) -> None:
+        """Additive migrations for databases created by an earlier version."""
+        columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(observations)")
+        }
+        if "enriched" not in columns:
+            self.connection.execute(
+                "ALTER TABLE observations ADD COLUMN enriched INTEGER NOT NULL DEFAULT 0"
+            )
+        self.connection.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
+            (str(SCHEMA_VERSION),),
+        )
+        self.connection.commit()
+
     def close(self) -> None:
         self.connection.close()
+
+    # ------------------------------------------------------------------- locks
+
+    def acquire_lock(self, name: str, *, ttl_seconds: int = 3600) -> str | None:
+        """Take a named lock, or return None if someone else holds it.
+
+        Expired locks are reclaimed so a killed process cannot wedge the
+        monitor permanently.
+        """
+        holder = uuid.uuid4().hex
+        now = utcnow()
+        expires = (now + timedelta(seconds=ttl_seconds)).isoformat()
+        self.connection.execute(
+            "DELETE FROM locks WHERE name = ? AND expires_at < ?", (name, now.isoformat())
+        )
+        cursor = self.connection.execute(
+            "INSERT OR IGNORE INTO locks(name, holder, expires_at) VALUES(?, ?, ?)",
+            (name, holder, expires),
+        )
+        self.connection.commit()
+        return holder if cursor.rowcount == 1 else None
+
+    def release_lock(self, name: str, holder: str) -> None:
+        self.connection.execute(
+            "DELETE FROM locks WHERE name = ? AND holder = ?", (name, holder)
+        )
+        self.connection.commit()
 
     # ---------------------------------------------------------------- sources
 
@@ -211,6 +283,28 @@ class Store:
         self.connection.commit()
         return cursor.rowcount == 1
 
+    def mark_enriched(self, source: str, external_id: str) -> None:
+        self.connection.execute(
+            "UPDATE observations SET enriched = 1 WHERE source = ? AND external_id = ?",
+            (source, external_id),
+        )
+        self.connection.commit()
+
+    def is_enriched(self, source: str, external_id: str) -> bool:
+        row = self.connection.execute(
+            "SELECT enriched FROM observations WHERE source = ? AND external_id = ?",
+            (source, external_id),
+        ).fetchone()
+        return bool(row and row["enriched"])
+
+    def unenriched_count(self, source: str) -> int:
+        return int(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM observations WHERE source = ? AND enriched = 0",
+                (source,),
+            ).fetchone()[0]
+        )
+
     def observation_count(self) -> int:
         return int(
             self.connection.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
@@ -224,51 +318,72 @@ class Store:
         ).fetchone()
         return row["state"] if row else None
 
-    def stage_alert(self, alert: Alert) -> bool:
-        """Reserve a delivery slot before calling Slack.
+    def claim_alert(self, alert: Alert) -> bool:
+        """Atomically claim the right to send this alert.
 
-        Returns True if this caller now owns the send. False means the alert was
-        already delivered (or is already staged by this run).
+        The claim is the INSERT itself: exactly one caller can create the row,
+        and that caller owns the send. Checking the state first and then sending
+        is a race -- two sources in one scan, or two concurrent scans, both see
+        a 'pending' or 'failed' row and both call Slack, so the same alert goes
+        out twice.
+
+        A row that already exists is left alone here. Retrying it is the
+        dedicated `claim_pending` path, which leases it just as atomically.
         """
-        existing = self.alert_state(alert.alert_key)
-        if existing == "sent":
-            return False
-        if existing is None:
-            self.connection.execute(
-                """INSERT INTO alerts
-                   (alert_key, company_key, kind, company_name, source, source_url,
-                    payload_json, state, attempts, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?)""",
-                (
-                    alert.alert_key,
-                    alert.company_key,
-                    alert.kind.value,
-                    alert.company_name,
-                    alert.source.value,
-                    alert.source_url,
-                    json.dumps(_alert_payload(alert), default=str),
-                    utcnow().isoformat(),
-                ),
-            )
+        cursor = self.connection.execute(
+            """INSERT OR IGNORE INTO alerts
+               (alert_key, company_key, kind, company_name, source, source_url,
+                payload_json, state, attempts, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'sending', 1, ?)""",
+            (
+                alert.alert_key,
+                alert.company_key,
+                alert.kind.value,
+                alert.company_name,
+                alert.source.value,
+                alert.source_url,
+                json.dumps(_alert_payload(alert), default=str),
+                utcnow().isoformat(),
+            ),
+        )
         self.connection.commit()
-        return True
+        return cursor.rowcount == 1
+
+    def claim_pending(self, alert_key: str) -> bool:
+        """Lease a previously staged alert for one more delivery attempt.
+
+        The conditional UPDATE is the lease: only the caller whose UPDATE
+        actually changed a row may send, so concurrent retries cannot both fire.
+        """
+        cursor = self.connection.execute(
+            """UPDATE alerts
+               SET state = 'sending', attempts = attempts + 1
+               WHERE alert_key = ? AND state IN ('pending', 'failed')""",
+            (alert_key,),
+        )
+        self.connection.commit()
+        return cursor.rowcount == 1
 
     def mark_alert_sent(self, key: str, slack_ts: str | None) -> None:
         self.connection.execute(
             """UPDATE alerts
-               SET state = 'sent', sent_at = ?, slack_ts = ?, last_error = NULL,
-                   attempts = attempts + 1
+               SET state = 'sent', sent_at = ?, slack_ts = ?, last_error = NULL
                WHERE alert_key = ?""",
             (utcnow().isoformat(), slack_ts, key),
         )
         self.connection.commit()
 
-    def mark_alert_failed(self, key: str, error: str) -> None:
+    def mark_alert_failed(self, key: str, error: str, *, terminal: bool = False) -> None:
+        """Record a failed send.
+
+        `terminal` marks it dead: a fatal Slack error such as channel_not_found
+        or invalid_auth cannot be fixed by trying again, so retrying it on every
+        scan just hides the real problem. Dead alerts stay visible in the health
+        report instead of being silently abandoned once attempts run out.
+        """
         self.connection.execute(
-            """UPDATE alerts
-               SET state = 'failed', last_error = ?, attempts = attempts + 1
-               WHERE alert_key = ?""",
-            (error[:500], key),
+            """UPDATE alerts SET state = ?, last_error = ? WHERE alert_key = ?""",
+            ("dead" if terminal else "failed", error[:500], key),
         )
         self.connection.commit()
 
@@ -276,13 +391,30 @@ class Store:
         """Alerts staged but never confirmed sent, oldest first.
 
         Retried at the start of the next scan so a Slack outage delays delivery
-        instead of losing it.
+        instead of losing it. Anything left 'sending' by a crashed process is
+        included, because nothing else will ever pick it up.
         """
         rows = self.connection.execute(
             """SELECT alert_key, payload_json, attempts FROM alerts
-               WHERE state IN ('pending', 'failed') AND attempts < 5
+               WHERE state IN ('pending', 'failed', 'sending')
+                 AND attempts < ?
                ORDER BY created_at LIMIT ?""",
-            (limit,),
+            (MAX_DELIVERY_ATTEMPTS, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def undelivered_alerts(self, limit: int = 50) -> list[dict[str, object]]:
+        """Alerts that will never be retried: dead, or out of attempts.
+
+        Surfaced by `launchsignal health` so an operator sees a broken channel
+        rather than a quietly emptying queue.
+        """
+        rows = self.connection.execute(
+            """SELECT alert_key, company_name, kind, state, attempts, last_error
+               FROM alerts
+               WHERE state = 'dead' OR (state != 'sent' AND attempts >= ?)
+               ORDER BY created_at DESC LIMIT ?""",
+            (MAX_DELIVERY_ATTEMPTS, limit),
         ).fetchall()
         return [dict(row) for row in rows]
 

@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from typing import Iterable, Iterator, Protocol, runtime_checkable
 
 from .http import NotModified, SourceError, get_json, get_text, request
-from .models import Evidence, Source
+from .models import PROGRAMME_SPEEDRUN, PROGRAMME_YC, Evidence, Source
 
 LOGGER = logging.getLogger("launchsignal.sources")
 
@@ -95,14 +95,21 @@ class YcSitemapSource:
         LOGGER.info("yc sitemap: %d company URLs", len(entries))
 
         enriched = 0
+        deferred = 0
         for slug, url, lastmod in entries:
             if slug in self.excluded_slugs:
                 continue
-            is_new = True
-            if store is not None:
-                is_new = not _already_observed(store, self.name.value, slug)
+            is_new = store is None or not _observed(store, self.name.value, slug)
             detail: dict[str, object] = {}
-            if enrich and is_new and enriched < self.max_enrich:
+            if enrich and is_new:
+                if enriched >= self.max_enrich:
+                    # Over the cap: skip this listing entirely rather than
+                    # recording it without detail. It stays unobserved, so the
+                    # next cycle still treats it as new and it alerts with a
+                    # batch and a description instead of being stranded
+                    # permanently as an enriched-never record.
+                    deferred += 1
+                    continue
                 detail = self._fetch_profile(slug)
                 enriched += 1
             yield Evidence(
@@ -122,10 +129,15 @@ class YcSitemapSource:
                     "enriched": bool(detail),
                 },
             )
-        if enrich and enriched >= self.max_enrich:
+            if store is not None and detail:
+                store.mark_enriched(self.name.value, slug)
+        if deferred:
+            # Reported, not silently applied: a reader of the logs can see that
+            # coverage this cycle was bounded and by how much.
             LOGGER.warning(
-                "yc: profile enrichment capped at %d this cycle; remaining new "
-                "companies will be enriched on the next scan",
+                "yc: %d new listing(s) deferred past this cycle's enrichment cap "
+                "of %d; they remain unobserved and will be picked up next scan",
+                deferred,
                 self.max_enrich,
             )
         if store is not None:
@@ -147,6 +159,13 @@ class YcSitemapSource:
 
 
 def _extract_yc_profile(body: str) -> dict[str, object]:
+    """Pull the company fields out of the profile page's embedded JSON.
+
+    Each field is decoded with json.loads on the quoted fragment. Running
+    .encode().decode("unicode_escape") over the text instead corrupts any
+    already-decoded UTF-8, turning "Cafe\u0301"-style names and emoji into
+    mojibake.
+    """
     unescaped = html.unescape(body)
     out: dict[str, object] = {}
     for key, target in (
@@ -156,14 +175,23 @@ def _extract_yc_profile(body: str) -> dict[str, object]:
         ("description", "description"),
         ("one_liner", "description"),
     ):
-        match = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.){{0,400}})"', unescaped)
-        if match and target not in out:
-            value = match.group(1).encode().decode("unicode_escape", errors="replace")
-            if value.strip():
-                out[target] = value.strip()
-    website = re.search(r'"url"\s*:\s*"(https?://(?:[^"\\]|\\.){0,200})"', unescaped)
+        if target in out:
+            continue
+        match = re.search(rf'"{key}"\s*:\s*("(?:[^"\\]|\\.){{0,400}}")', unescaped)
+        if not match:
+            continue
+        try:
+            value = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, str) and value.strip():
+            out[target] = value.strip()
+    website = re.search(r'"url"\s*:\s*("https?://(?:[^"\\]|\\.){0,200}")', unescaped)
     if website:
-        out["website"] = website.group(1)
+        try:
+            out["website"] = json.loads(website.group(1))
+        except json.JSONDecodeError:
+            pass
     return out
 
 
@@ -320,9 +348,14 @@ class TinyfishSearchSource:
         *,
         recency_minutes: int | None = None,
         allowed_authors: tuple[str, ...] = (),
+        programme: str | None = None,
     ) -> None:
         self.name = source
         self.queries = queries
+        #: For an official source, the programme whose announcements it carries.
+        #: Comparing a YC claim against a16z's account (or the reverse) lets one
+        #: programme's post suppress the other programme's early signal.
+        self.programme = programme
         #: The freshness window. This is the actual early-detection lever: a
         #: founder post minutes old is what the task is asking for, so the
         #: founder lane asks the index for recent results explicitly.
@@ -335,6 +368,11 @@ class TinyfishSearchSource:
     @property
     def configured(self) -> bool:
         return bool(os.environ.get("TINYFISH_API_KEY"))
+
+    @property
+    def account_labels(self) -> tuple[str, ...]:
+        """The actual accounts this source reads, for the alert's audit trail."""
+        return tuple(f"@{author}" for author in self.allowed_authors) or (self.name.value,)
 
     def scan(self, store=None) -> Iterator[Evidence]:
         api_key = os.environ.get("TINYFISH_API_KEY")
@@ -407,6 +445,8 @@ def _canonical_id(url: str) -> str:
 
 
 _X_HOSTS = {"x.com", "twitter.com", "mobile.x.com", "mobile.twitter.com"}
+#: /company/<slug> and nothing deeper.
+_COMPANY_ROOT = re.compile(r"/company/[\w\-.%]+/?")
 
 
 def is_allowed_public_url(
@@ -433,7 +473,9 @@ def is_allowed_public_url(
             return False
         return _author_allowed(_linkedin_owner(path), allowed_authors)
     if source is Source.LINKEDIN_COMPANY:
-        return host.endswith("linkedin.com") and "/company/" in path
+        # Must be the company root. "/company/acme/posts/x_activity-1" is a
+        # post, and labelling it "company page first observed" is simply wrong.
+        return bool(host.endswith("linkedin.com") and _COMPANY_ROOT.fullmatch(path))
     return False
 
 
@@ -452,16 +494,16 @@ def _linkedin_owner(path: str) -> str:
     return match.group(1).split("_")[0]
 
 
-def _titleise(slug: str) -> str:
-    return " ".join(part.capitalize() for part in slug.split("-") if part)
-
-
-def _already_observed(store, source: str, external_id: str) -> bool:
+def _observed(store, source: str, external_id: str) -> bool:
     row = store.connection.execute(
         "SELECT 1 FROM observations WHERE source = ? AND external_id = ?",
         (source, external_id),
     ).fetchone()
     return row is not None
+
+
+def _titleise(slug: str) -> str:
+    return " ".join(part.capitalize() for part in slug.split("-") if part)
 
 
 # ------------------------------------------------------------------- registry
@@ -473,54 +515,80 @@ def _batches() -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
-def _official_x_accounts() -> tuple[str, ...]:
-    raw = os.environ.get("LAUNCHSIGNAL_OFFICIAL_X", "ycombinator,a16z,speedrun")
+def _accounts(name: str, default: str) -> tuple[str, ...]:
+    raw = os.environ.get(name, default)
     return tuple(item.strip().lstrip("@") for item in raw.split(",") if item.strip())
 
 
+#: Claim phrasings, split by programme so a Speedrun post is never keyed,
+#: labelled or compared as a YC claim.
+_YC_TERMS = (
+    '"got into YC"',
+    '"accepted into Y Combinator"',
+    '"got accepted into YC"',
+)
+_SPEEDRUN_TERMS = (
+    '"a16z Speedrun"',
+    '"joined Speedrun"',
+)
+
+
+def _claim_terms() -> list[str]:
+    return [*_YC_TERMS, *(f'"{batch}"' for batch in _batches()), *_SPEEDRUN_TERMS]
+
+
 def social_sources(*, recency_minutes: int | None = None) -> list[TinyfishSearchSource]:
-    """Founder-claim discovery on X and LinkedIn, plus LinkedIn company pages."""
-    batch_terms = [f'"{batch}"' for batch in _batches()]
-    claim_terms = [
-        '"got into YC"',
-        '"accepted into Y Combinator"',
-        '"got accepted into YC"',
-        '"a16z Speedrun"',
-    ]
-    x_queries = [f"site:x.com {term}" for term in claim_terms + batch_terms]
-    li_queries = [
-        f"site:linkedin.com/posts {term}" for term in claim_terms + batch_terms
-    ]
-    # Requirement: new LinkedIn *company page* creations, not only posts. These
-    # were missing entirely; a company-page query family is a separate source.
-    company_queries = [
-        f'site:linkedin.com/company {term}' for term in claim_terms + batch_terms
-    ]
+    """Founder-claim discovery on X and LinkedIn, plus LinkedIn company pages.
+
+    The programme is not fixed per query family: one search can return both, and
+    a post can mention either. It is resolved from the claim text by
+    `classifier.resolve_programme`.
+    """
+    terms = _claim_terms()
     return [
-        TinyfishSearchSource(Source.X, x_queries, recency_minutes=recency_minutes),
-        TinyfishSearchSource(Source.LINKEDIN, li_queries, recency_minutes=recency_minutes),
         TinyfishSearchSource(
-            Source.LINKEDIN_COMPANY, company_queries, recency_minutes=recency_minutes
+            Source.X,
+            [f"site:x.com {term}" for term in terms],
+            recency_minutes=recency_minutes,
+        ),
+        TinyfishSearchSource(
+            Source.LINKEDIN,
+            [f"site:linkedin.com/posts {term}" for term in terms],
+            recency_minutes=recency_minutes,
+        ),
+        # Requirement: new LinkedIn *company page* creations, not only posts.
+        TinyfishSearchSource(
+            Source.LINKEDIN_COMPANY,
+            [f"site:linkedin.com/company {term}" for term in terms],
+            recency_minutes=recency_minutes,
         ),
     ]
 
 
 def official_sources() -> list[TinyfishSearchSource]:
-    """Snapshots of what the programmes themselves have posted."""
-    accounts = _official_x_accounts()
+    """Snapshots of what each programme itself has posted, scoped per programme."""
     batch_terms = [f'"{batch}"' for batch in _batches()]
-    x_queries = [
-        f"site:x.com/{account} {term}" for account in accounts for term in batch_terms
-    ]
-    li_queries = [
-        f'site:linkedin.com/company/y-combinator {term}' for term in batch_terms
-    ]
+    yc_x = _accounts("LAUNCHSIGNAL_OFFICIAL_X", "ycombinator")
+    yc_li = _accounts("LAUNCHSIGNAL_OFFICIAL_LINKEDIN", "y-combinator")
+    sr_x = _accounts("LAUNCHSIGNAL_OFFICIAL_SPEEDRUN_X", "a16z,speedrun")
     return [
         TinyfishSearchSource(
-            Source.OFFICIAL_X, x_queries, allowed_authors=accounts
+            Source.OFFICIAL_X,
+            [f"site:x.com/{account} {term}" for account in yc_x for term in batch_terms],
+            allowed_authors=yc_x,
+            programme=PROGRAMME_YC,
         ),
         TinyfishSearchSource(
-            Source.OFFICIAL_LINKEDIN, li_queries, allowed_authors=("y-combinator",)
+            Source.OFFICIAL_LINKEDIN,
+            [f"site:linkedin.com/company/{account} {term}" for account in yc_li for term in batch_terms],
+            allowed_authors=yc_li,
+            programme=PROGRAMME_YC,
+        ),
+        TinyfishSearchSource(
+            Source.OFFICIAL_X,
+            [f'site:x.com/{account} "Speedrun"' for account in sr_x],
+            allowed_authors=sr_x,
+            programme=PROGRAMME_SPEEDRUN,
         ),
     ]
 

@@ -17,6 +17,8 @@ import re
 import unicodedata
 
 from .models import (
+    PROGRAMME_SPEEDRUN,
+    PROGRAMME_YC,
     Evidence,
     OfficialCheck,
     OfficialState,
@@ -265,6 +267,25 @@ def batch_label(evidence: Evidence) -> str | None:
 # ------------------------------------------------------------- classification
 
 
+def resolve_programme(evidence: Evidence) -> str:
+    """Which programme is this evidence about?
+
+    A directory states its own programme and is trusted. Social evidence has to
+    be read from the claim: a search adapter cannot know in advance, and
+    defaulting to "YC" turned every Speedrun post into an "EARLY YC SIGNAL"
+    with a YC company key, compared against YC's official accounts.
+    """
+    if category_of(evidence.source) is SourceCategory.DIRECTORY:
+        return evidence.programme
+    if _SPEEDRUN_CLAIM.search(evidence.text):
+        return PROGRAMME_SPEEDRUN
+    if _ACCEPTANCE.search(evidence.text) or _BATCH.search(evidence.text) or _BATCH_SHORT.search(
+        evidence.text
+    ):
+        return PROGRAMME_YC
+    return evidence.programme
+
+
 def claim_kind(evidence: Evidence) -> SignalKind:
     category = category_of(evidence.source)
     if category is SourceCategory.DIRECTORY:
@@ -287,15 +308,23 @@ def official_check(
     official_evidence: list[Evidence],
     accounts_checked: tuple[str, ...],
     checked_at,
+    *,
+    min_snapshots: int = 1,
 ) -> OfficialCheck:
     """Compare a claim against official snapshots, honestly.
 
-    When no snapshots were collected the result is NOT_CHECKED. It is never
-    NOT_SEEN, because "I looked at nothing and found nothing" is not evidence
-    that a programme has stayed quiet.
+    NOT_SEEN requires that snapshots were actually obtained. A search that
+    succeeds but returns nothing -- an unsupported operator, an account not yet
+    indexed -- yields zero snapshots, and concluding "not yet announced" from
+    that is the same zero-evidence error as not checking at all.
     """
-    if not accounts_checked:
-        return OfficialCheck(state=OfficialState.NOT_CHECKED)
+    if not accounts_checked or len(official_evidence) < max(1, min_snapshots):
+        return OfficialCheck(
+            state=OfficialState.NOT_CHECKED,
+            accounts_checked=accounts_checked,
+            snapshots_seen=len(official_evidence),
+            checked_at=checked_at if accounts_checked else None,
+        )
     match = _first_official_match(company_name, official_evidence)
     if match is not None:
         return OfficialCheck(

@@ -156,3 +156,28 @@ class HttpRetryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EnvDuplicateKeyTest(unittest.TestCase):
+    """A duplicate key inside .env must be last-wins, like every other loader."""
+
+    def setUp(self) -> None:
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = Path(self.dir.name) / ".env"
+
+    def tearDown(self) -> None:
+        for key in ("LS_DUP_A", "LS_DUP_B"):
+            os.environ.pop(key, None)
+
+    def test_later_line_overrides_an_earlier_one(self) -> None:
+        self.path.write_text("LS_DUP_A=first\nLS_DUP_A=second\n", encoding="utf-8")
+        loaded = load_env(str(self.path))
+        self.assertEqual(os.environ["LS_DUP_A"], "second")
+        self.assertEqual(loaded.count("LS_DUP_A"), 1, "reported once, not twice")
+
+    def test_real_environment_still_wins_over_the_whole_file(self) -> None:
+        os.environ["LS_DUP_B"] = "from-environment"
+        self.path.write_text("LS_DUP_B=first\nLS_DUP_B=second\n", encoding="utf-8")
+        load_env(str(self.path))
+        self.assertEqual(os.environ["LS_DUP_B"], "from-environment")

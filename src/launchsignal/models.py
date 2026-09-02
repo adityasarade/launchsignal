@@ -26,6 +26,13 @@ class Source(StrEnum):
     OFFICIAL_LINKEDIN = "official_linkedin"
 
 
+#: Programme labels. Speedrun is a16z's programme, not YC's, and the two are
+#: never conflated: separate labels, separate company keys, separate official
+#: accounts to compare against.
+PROGRAMME_YC = "YC"
+PROGRAMME_SPEEDRUN = "a16z Speedrun"
+
+
 class SourceCategory(StrEnum):
     """How a source's evidence should be interpreted.
 
@@ -126,9 +133,17 @@ class OfficialCheck:
 
     def describe(self) -> str:
         if self.state is OfficialState.NOT_CHECKED:
+            if not self.accounts_checked:
+                return (
+                    "not checked - no official-snapshot source is configured, so "
+                    "this alert makes no claim about whether the programme has "
+                    "announced yet"
+                )
+            accounts = ", ".join(self.accounts_checked)
             return (
-                "not checked - no official-snapshot source is configured, so this "
-                "alert makes no claim about whether the programme has announced yet"
+                f"inconclusive - the search of {accounts} returned no usable "
+                "snapshots, so this alert makes no claim about whether the "
+                "programme has announced yet"
             )
         accounts = ", ".join(self.accounts_checked) or "none"
         stamp = self.checked_at.strftime("%Y-%m-%d %H:%M UTC") if self.checked_at else "unknown"

@@ -279,6 +279,66 @@ class BaselineEnrichmentTest(unittest.TestCase):
                          "baseline must not spend ~6000 profile fetches")
         self.assertTrue(all(i.batch is None for i in items))
 
+    def test_already_observed_records_are_not_refetched(self) -> None:
+        """Enrichment is for listings that will alert.
+
+        Backfilling detail for thousands of already-observed companies costs
+        one request each and changes nothing: they can never alert again.
+        """
+        import tempfile
+
+        from launchsignal.store import Store
+
+        fake, calls = self._adapter_with_fakes()
+        original = sources.get_text
+        sources.get_text = fake
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(f"{directory}/s.sqlite3")
+            try:
+                store.complete_baseline("yc_directory")
+                for slug in ("fresco", "ticket-wallet"):
+                    store.connection.execute(
+                        """INSERT INTO observations (source, external_id, company_key,
+                           url, title, excerpt, observed_at, metadata_json)
+                           VALUES ('yc_directory', ?, 'k', 'u', 't', 'e', '2026-01-01', '{}')""",
+                        (slug,),
+                    )
+                store.connection.commit()
+                calls.clear()
+                list(sources.YcSitemapSource().scan(store))
+            finally:
+                sources.get_text = original
+                store.close()
+        self.assertEqual([c for c in calls if "sitemap" not in c], [])
+
+    def test_a_deferred_listing_stays_new_for_the_next_cycle(self) -> None:
+        """Over the cap, a listing is skipped rather than stored without detail.
+
+        Storing it unenriched strands it: it can never be enriched again and it
+        alerts with no batch and no description.
+        """
+        import tempfile
+
+        from launchsignal.store import Store
+
+        fake, calls = self._adapter_with_fakes()
+        original = sources.get_text
+        sources.get_text = fake
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(f"{directory}/s.sqlite3")
+            try:
+                store.complete_baseline("yc_directory")
+                first = list(sources.YcSitemapSource(max_enrich=1).scan(store))
+                self.assertEqual(len(first), 1, "only the capped number is yielded")
+                self.assertEqual(first[0].batch, "YC F24")
+                # Nothing was recorded for the deferred slug, so a later cycle
+                # still sees it as new.
+                second = list(sources.YcSitemapSource(max_enrich=5).scan(store))
+                self.assertEqual(len(second), 2)
+            finally:
+                sources.get_text = original
+                store.close()
+
     def test_post_baseline_scan_enriches_new_companies(self) -> None:
         import tempfile
 

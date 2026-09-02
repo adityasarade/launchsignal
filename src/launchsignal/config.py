@@ -26,6 +26,11 @@ def load_env(path: str | os.PathLike[str] = ".env", *, override: bool = False) -
     if not file.is_file():
         return []
     loaded: list[str] = []
+    # Track what this file has set so far, separately from the real environment.
+    # Using os.environ as the guard conflates the two, which makes a duplicate
+    # key inside the file first-wins -- so appending a line to override an
+    # earlier one silently does nothing.
+    from_file: set[str] = set()
     for raw in file.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -38,10 +43,12 @@ def load_env(path: str | os.PathLike[str] = ".env", *, override: bool = False) -
             value = value[1:-1]
         else:
             value = value.split(" #")[0].rstrip()
-        if key in os.environ and not override:
+        if key in os.environ and key not in from_file and not override:
             continue
         os.environ[key] = value
-        loaded.append(key)
+        from_file.add(key)
+        if key not in loaded:
+            loaded.append(key)
     return loaded
 
 
