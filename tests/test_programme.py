@@ -8,12 +8,15 @@ from launchsignal.classifier import official_check, resolve_programme
 from launchsignal.models import (
     PROGRAMME_SPEEDRUN,
     PROGRAMME_YC,
+    Alert,
     Evidence,
+    OfficialCheck,
     OfficialState,
     SignalKind,
     Source,
     utcnow,
 )
+from launchsignal.notify import headline
 from launchsignal.store import company_key
 
 
@@ -48,6 +51,30 @@ class ProgrammeResolutionTest(unittest.TestCase):
 
 
 class ProgrammeRoutingTest(MonitorCase):
+    def test_same_cycle_candidate_names_reach_official_lookup(self) -> None:
+        """An official post without a batch label must still suppress a scoop."""
+        self.run_scan(FakeSource(Source.X, []))
+        captured: dict[str, object] = {}
+
+        def build_official(candidates):
+            captured.update(candidates)
+            return [FakeSource(Source.OFFICIAL_X, [
+                Evidence(
+                    source=Source.OFFICIAL_X, external_id="official-1",
+                    url="https://x.com/ycombinator/status/1", title="",
+                    excerpt="Welcome Zephyr to the YC community!",
+                )
+            ])]
+
+        source = FakeSource(
+            Source.X, [social("Founder of Zephyr — we got into YC S26!")]
+        )
+        result = self.monitor.run([source], build_official)
+        self.assertEqual(source.scans, 1, "candidate discovery must not re-read X")
+        self.assertEqual(captured, {PROGRAMME_YC: {"Zephyr"}})
+        self.assertEqual(result["official_candidate_names"], {PROGRAMME_YC: ["Zephyr"]})
+        self.assertEqual(self.notifier.sent[-1].official.state, OfficialState.SEEN)
+
     def test_a_speedrun_post_alerts_as_speedrun(self) -> None:
         self.run_scan(FakeSource(Source.X, []))
         self.run_scan(
@@ -56,6 +83,31 @@ class ProgrammeRoutingTest(MonitorCase):
         alert = self.notifier.sent[-1]
         self.assertEqual(alert.programme, PROGRAMME_SPEEDRUN)
         self.assertEqual(alert.batch, "SR004")
+
+    def test_rendered_early_speedrun_headline_names_speedrun_not_yc(self) -> None:
+        alert = Alert(
+            alert_key="speedrun|early",
+            company_key="speedrun",
+            kind=SignalKind.EARLY_FOUNDER_CLAIM,
+            company_name="Pixel",
+            programme=PROGRAMME_SPEEDRUN,
+            source=Source.X,
+            source_url="https://x.com/f/status/1",
+            excerpt="we joined a16z Speedrun SR004",
+            official=OfficialCheck(
+                state=OfficialState.NOT_SEEN,
+                accounts_checked=("@a16z",),
+                snapshots_seen=1,
+                checked_at=utcnow(),
+            ),
+        )
+
+        rendered = headline(alert)
+        self.assertEqual(
+            rendered,
+            "EARLY A16Z SPEEDRUN SIGNAL — Founder Announced Before a16z Speedrun",
+        )
+        self.assertNotIn("YC", rendered)
 
     def test_one_programmes_announcement_cannot_suppress_the_others_claim(self) -> None:
         """a16z posting about "Acme" must not answer a question about YC's Acme."""

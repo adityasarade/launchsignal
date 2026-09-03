@@ -23,11 +23,18 @@ from pathlib import Path
 
 from .models import Alert, Evidence, ReviewItem, SignalKind, utcnow
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: Deliveries are retried this many times before the alert is reported as
 #: undelivered rather than retried forever.
 MAX_DELIVERY_ATTEMPTS = 5
+
+#: A process may die after claiming an alert but before recording Slack's
+#: response. Keep that claim exclusive while a normal HTTP attempt can still
+#: be running, then allow a later scan to reclaim it. This gives bounded
+#: at-least-once delivery: if Slack accepted the message immediately before the
+#: crash, the replay can duplicate it, but the alert is never stranded forever.
+DELIVERY_LEASE_SECONDS = 300
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -74,6 +81,7 @@ CREATE TABLE IF NOT EXISTS alerts (
   attempts     INTEGER NOT NULL DEFAULT 0,
   last_error   TEXT,
   created_at   TEXT NOT NULL,
+  delivery_started_at TEXT,
   sent_at      TEXT,
   slack_ts     TEXT
 );
@@ -152,14 +160,19 @@ class Store:
 
     def _migrate(self) -> None:
         """Additive migrations for databases created by an earlier version."""
-        columns = {
+        observation_columns = {
             row["name"]
             for row in self.connection.execute("PRAGMA table_info(observations)")
         }
-        if "enriched" not in columns:
+        if "enriched" not in observation_columns:
             self.connection.execute(
                 "ALTER TABLE observations ADD COLUMN enriched INTEGER NOT NULL DEFAULT 0"
             )
+        alert_columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(alerts)")
+        }
+        if "delivery_started_at" not in alert_columns:
+            self.connection.execute("ALTER TABLE alerts ADD COLUMN delivery_started_at TEXT")
         self.connection.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
             (str(SCHEMA_VERSION),),
@@ -333,8 +346,8 @@ class Store:
         cursor = self.connection.execute(
             """INSERT OR IGNORE INTO alerts
                (alert_key, company_key, kind, company_name, source, source_url,
-                payload_json, state, attempts, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'sending', 1, ?)""",
+                payload_json, state, attempts, created_at, delivery_started_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'sending', 1, ?, ?)""",
             (
                 alert.alert_key,
                 alert.company_key,
@@ -343,6 +356,7 @@ class Store:
                 alert.source.value,
                 alert.source_url,
                 json.dumps(_alert_payload(alert), default=str),
+                utcnow().isoformat(),
                 utcnow().isoformat(),
             ),
         )
@@ -354,12 +368,21 @@ class Store:
 
         The conditional UPDATE is the lease: only the caller whose UPDATE
         actually changed a row may send, so concurrent retries cannot both fire.
+        A `sending` row is eligible only after its lease expires. A NULL lease
+        is from an older schema and is treated as stale so upgrades recover it.
         """
+        now = utcnow()
+        stale_before = (now - timedelta(seconds=DELIVERY_LEASE_SECONDS)).isoformat()
         cursor = self.connection.execute(
             """UPDATE alerts
-               SET state = 'sending', attempts = attempts + 1
-               WHERE alert_key = ? AND state IN ('pending', 'failed')""",
-            (alert_key,),
+               SET state = 'sending', attempts = attempts + 1,
+                   delivery_started_at = ?
+               WHERE alert_key = ? AND (
+                   state IN ('pending', 'failed') OR
+                   (state = 'sending' AND
+                    (delivery_started_at IS NULL OR delivery_started_at <= ?))
+               )""",
+            (now.isoformat(), alert_key, stale_before),
         )
         self.connection.commit()
         return cursor.rowcount == 1
@@ -391,15 +414,22 @@ class Store:
         """Alerts staged but never confirmed sent, oldest first.
 
         Retried at the start of the next scan so a Slack outage delays delivery
-        instead of losing it. Anything left 'sending' by a crashed process is
-        included, because nothing else will ever pick it up.
+        instead of losing it. A `sending` row is included only when its lease
+        is stale; a fresh in-flight request must not be sent concurrently.
         """
+        stale_before = (
+            utcnow() - timedelta(seconds=DELIVERY_LEASE_SECONDS)
+        ).isoformat()
         rows = self.connection.execute(
             """SELECT alert_key, payload_json, attempts FROM alerts
-               WHERE state IN ('pending', 'failed', 'sending')
+               WHERE (
+                   state IN ('pending', 'failed') OR
+                   (state = 'sending' AND
+                    (delivery_started_at IS NULL OR delivery_started_at <= ?))
+               )
                  AND attempts < ?
                ORDER BY created_at LIMIT ?""",
-            (MAX_DELIVERY_ATTEMPTS, limit),
+            (stale_before, MAX_DELIVERY_ATTEMPTS, limit),
         ).fetchall()
         return [dict(row) for row in rows]
 

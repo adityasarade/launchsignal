@@ -56,7 +56,7 @@ def scan_once(store: Store, notifier: SlackNotifier, *, fast: bool = False) -> d
     """
     if not fast:
         sources = [*directory_sources(), *social_sources()]
-        return Monitor(store, notifier).run(sources, official_sources())
+        return Monitor(store, notifier).run(sources, official_sources)
 
     window = max(fast_lane_minutes() * 3, 90)
     candidates = social_sources(recency_minutes=window)
@@ -77,7 +77,7 @@ def scan_once(store: Store, notifier: SlackNotifier, *, fast: bool = False) -> d
             "baselined_sources": [], "sources": [], "outcome": "ok",
             "skipped_pending_baseline": skipped,
         }
-    result = Monitor(store, notifier).run(ready, official_sources())
+    result = Monitor(store, notifier).run(ready, official_sources)
     result["skipped_pending_baseline"] = skipped
     return result
 

@@ -158,6 +158,15 @@ evidence that a programme has stayed quiet, so the card never says it is. Every
 early alert carries the accounts checked, how many snapshots were read, and
 when — an auditable statement instead of an absolute negative.
 
+For every full or fast social cycle, LaunchSignal first collects the bounded
+candidate set, then queries the configured official accounts for the current
+batch labels **and exact candidate names** before it classifies the staged
+posts. Candidate-name queries are capped at ten identities per programme (five
+names per query), preventing a noisy search result from expanding request
+volume. If an official source fails or returns no snapshots, the card remains
+unverified; it is never called an early scoop because a batch-only search
+missed a company name.
+
 Directory membership never suppresses an early claim. A company can be listed
 in the directory *and* still have been announced by its founder first, so
 `CONFIRMED` and `EARLY_FOUNDER_CLAIM` are separate alerts about the same
@@ -178,8 +187,17 @@ company.
 - **Atomic delivery claim.** The alert row is written *before* the Slack call,
   and the write itself is the claim: exactly one caller can create a given
   `alert_key`, so two sources in one scan — or two concurrent scans — cannot
-  both send. Retries take an equally atomic lease. Sends are paced to Slack's
-  rate limit and `429` is honoured.
+  both send. Retries take an equally atomic five-minute lease. A process killed
+  mid-send leaves a `sending` row; a later scan reclaims it only after that
+  lease expires, so a still-running HTTP request is never replayed concurrently.
+  Sends are paced to Slack's rate limit and `429` is honoured.
+- **Explicit crash policy.** Slack offers no transaction spanning its API and
+  this SQLite database, so delivery is bounded **at least once**, not magically
+  exactly once. If Slack accepted a message just before the process died but
+  its acknowledgement was not recorded, the stale-lease replay can produce
+  one duplicate. This deliberate tradeoff prevents permanent loss; retries
+  stop after five attempts and exhausted alerts are shown by `health` for
+  operator reconciliation.
 - **Dead-lettering.** A transient failure is retried on later scans. A fatal one
   (`channel_not_found`, `invalid_auth`) is recorded as dead immediately and
   shown by `launchsignal health`, rather than retried until an attempt budget
@@ -236,7 +254,7 @@ starting a second scan. Auth **fails closed**: with no `POND_ACCESS_KEY` set,
 ## Tests
 
 ```bash
-make test        # 172 tests, no network access
+make test        # no network access
 ```
 
 Every test maps to a behaviour that matters: the baseline is silent, an

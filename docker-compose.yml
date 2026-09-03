@@ -5,6 +5,9 @@ services:
   monitor:
     build: .
     env_file: [.env]
+    environment:
+      # Override host-native values: this path is the mounted named volume.
+      LAUNCHSIGNAL_DB_PATH: /data/launchsignal.sqlite3
     volumes: ["launchsignal-data:/data"]
     restart: unless-stopped
     command: ["serve"]
@@ -14,6 +17,8 @@ services:
   pond:
     build: .
     env_file: [.env]
+    environment:
+      LAUNCHSIGNAL_DB_PATH: /data/launchsignal.sqlite3
     volumes: ["launchsignal-data:/data"]
     restart: unless-stopped
     ports: ["8080:8080"]

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
 
 from .classifier import (
     author_name,
@@ -35,6 +35,7 @@ from .models import (
     OfficialState,
     ReviewItem,
     SignalKind,
+    Source,
     SourceOutcome,
     utcnow,
 )
@@ -54,7 +55,8 @@ class Monitor:
     def run(
         self,
         sources: Iterable[object],
-        official_sources: Iterable[object] = (),
+        official_sources: Iterable[object]
+        | Callable[[Mapping[str, Iterable[str]]], Iterable[object]] = (),
     ) -> dict[str, object]:
         run_id = self.store.start_run()
         counts: dict[str, object] = {
@@ -68,11 +70,33 @@ class Monitor:
         }
 
         counts["retried"] = self._flush_pending()
+
+        # Read founder sources once, then use the resolved candidate names to
+        # make this cycle's official-account search specific to those posts.
+        # A batch-only official query can miss a company that an official
+        # account announced without repeating the batch label.
+        source_list = list(sources)
+        staged: list[tuple[object, SourceOutcome, bool, list[Evidence]]] = []
+        social_names = {Source.X, Source.LINKEDIN, Source.LINKEDIN_COMPANY}
+        for source in source_list:
+            if getattr(source, "name", None) in social_names:
+                staged.append(self._read_source(source))
+
+        if callable(official_sources):
+            candidates = self._official_candidates(staged)
+            official_sources = official_sources(candidates)
+            counts["official_candidate_names"] = {
+                programme: sorted(names) for programme, names in candidates.items()
+            }
         official = self._collect_official(official_sources, counts)
 
-        for source in sources:
+        for source, outcome, baseline, evidence_items in staged:
+            self._finish_source(source, outcome, baseline, evidence_items, official, counts)
+
+        for source in source_list:
+            if getattr(source, "name", None) in social_names:
+                continue
             outcome = self._run_source(source, official, counts)
-            counts["sources"].append(vars(outcome))
 
         failures = [s for s in counts["sources"] if not s["ok"]]
         outcome_label = "ok" if not failures else f"partial ({len(failures)} source(s) failed)"
@@ -80,46 +104,78 @@ class Monitor:
         counts["outcome"] = outcome_label
         return counts
 
+    def _official_candidates(
+        self, staged: Iterable[tuple[object, SourceOutcome, bool, list[Evidence]]]
+    ) -> dict[str, set[str]]:
+        """Names whose founder claim needs a same-cycle official comparison."""
+        candidates: dict[str, set[str]] = {}
+        for _source, outcome, _baseline, evidence_items in staged:
+            if not outcome.ok:
+                continue
+            for evidence in evidence_items:
+                if claim_kind(evidence) is not SignalKind.EARLY_FOUNDER_CLAIM:
+                    continue
+                company, _reason = resolve_company(evidence)
+                if company:
+                    candidates.setdefault(resolve_programme(evidence), set()).add(company)
+        return candidates
+
+    def _read_source(
+        self, source: object,
+    ) -> tuple[object, SourceOutcome, bool, list[Evidence]]:
+        """Materialise one bounded social result set before official lookup."""
+        name = getattr(source, "name", None)
+        label = name.value if name is not None else str(source)
+        started = time.monotonic()
+        baseline = not self.store.baseline_complete(label)
+        outcome = SourceOutcome(source=label, ok=True)
+        try:
+            items = list(source.scan(self.store))
+        except SourceError as error:
+            outcome.ok = False
+            outcome.error = error.message
+            self.store.record_source_failure(label, error.message)
+            LOGGER.error("source %s failed: %s", label, error.message)
+            items = []
+        except Exception as error:
+            outcome.ok = False
+            outcome.error = f"{type(error).__name__}: {error}"
+            self.store.record_source_failure(label, outcome.error)
+            LOGGER.exception("source %s raised unexpectedly", label)
+            items = []
+        outcome.duration_ms = int((time.monotonic() - started) * 1000)
+        return source, outcome, baseline, items
+
+    def _finish_source(
+        self,
+        source: object,
+        outcome: SourceOutcome,
+        baseline: bool,
+        evidence_items: Iterable[Evidence],
+        official: dict[str, tuple[list[Evidence], tuple[str, ...]]],
+        counts: dict[str, object],
+    ) -> None:
+        """Ingest a completed source read and commit its source health state."""
+        if outcome.ok:
+            for evidence in evidence_items:
+                outcome.observations += 1
+                counts["observations"] = int(counts["observations"]) + 1
+                if self._ingest(evidence, baseline, official, counts, outcome):
+                    outcome.new += 1
+            self.store.record_source_success(outcome.source)
+            if baseline:
+                self.store.complete_baseline(outcome.source)
+                counts["baselined_sources"].append(outcome.source)
+        counts["sources"].append(vars(outcome))
+
     def _run_source(
         self,
         source: object,
         official: dict[str, tuple[list[Evidence], tuple[str, ...]]],
         counts: dict[str, object],
     ) -> SourceOutcome:
-        name = getattr(source, "name", None)
-        label = name.value if name is not None else str(source)
-        started = time.monotonic()
-        # Baseline is decided per source. A source that has never succeeded must
-        # seed silently even if its siblings are long past baseline, and a source
-        # that fails mid-baseline must not drag the others back through one.
-        baseline = not self.store.baseline_complete(label)
-        outcome = SourceOutcome(source=label, ok=True)
-        try:
-            for evidence in source.scan(self.store):
-                outcome.observations += 1
-                counts["observations"] = int(counts["observations"]) + 1
-                if self._ingest(evidence, baseline, official, counts, outcome):
-                    outcome.new += 1
-        except SourceError as error:
-            # One bad source is reported and skipped. It does not abort the scan,
-            # and it does not mark its own baseline complete.
-            outcome.ok = False
-            outcome.error = error.message
-            self.store.record_source_failure(label, error.message)
-            LOGGER.error("source %s failed: %s", label, error.message)
-        except Exception as error:
-            outcome.ok = False
-            outcome.error = f"{type(error).__name__}: {error}"
-            self.store.record_source_failure(label, outcome.error)
-            LOGGER.exception("source %s raised unexpectedly", label)
-        else:
-            self.store.record_source_success(label)
-            if baseline:
-                # Only on a clean pass. Completing the baseline after a partial
-                # read would permanently hide everything the failed half missed.
-                self.store.complete_baseline(label)
-                counts["baselined_sources"].append(label)
-        outcome.duration_ms = int((time.monotonic() - started) * 1000)
+        _source, outcome, baseline, evidence_items = self._read_source(source)
+        self._finish_source(source, outcome, baseline, evidence_items, official, counts)
         return outcome
 
     def _ingest(

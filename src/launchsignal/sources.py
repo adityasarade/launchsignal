@@ -20,7 +20,7 @@ import os
 import re
 import urllib.parse
 import xml.etree.ElementTree as ElementTree
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from typing import Protocol, runtime_checkable
 
 from .http import NotModified, SourceError, get_json, get_text
@@ -113,6 +113,14 @@ class YcSitemapSource:
                     continue
                 detail = self._fetch_profile(slug)
                 enriched += 1
+                if detail is None:
+                    # Do not record a new company with the fallback name after
+                    # a temporary profile outage. That would make the item no
+                    # longer new and strand its batch/description forever.
+                    # Leaving it unobserved gives it one bounded retry next
+                    # cycle, never a new baseline of every YC profile.
+                    deferred += 1
+                    continue
             yield Evidence(
                 source=self.name,
                 external_id=slug,
@@ -144,7 +152,7 @@ class YcSitemapSource:
         if store is not None:
             store.set_etag(self.name.value, response.etag)
 
-    def _fetch_profile(self, slug: str) -> dict[str, object]:
+    def _fetch_profile(self, slug: str) -> dict[str, object] | None:
         """Pull batch, description and canonical name off a company profile.
 
         The page embeds an HTML-escaped JSON blob; parsing that is far more
@@ -155,7 +163,7 @@ class YcSitemapSource:
             body, _ = get_text(url, source=f"{self.name.value}:profile", attempts=2)
         except SourceError as error:
             LOGGER.warning("yc profile %s unavailable: %s", slug, error.message)
-            return {}
+            return None
         return _extract_yc_profile(body)
 
 
@@ -465,7 +473,10 @@ class TinyfishSearchSource:
         recency_minutes: int | None = None,
         allowed_authors: tuple[str, ...] = (),
         programme: str | None = None,
+        max_pages: int = 3,
     ) -> None:
+        if not 1 <= max_pages <= 11:
+            raise ValueError("max_pages must be between 1 and Tinyfish's 11-page limit")
         self.name = source
         self.queries = queries
         #: For an official source, the programme whose announcements it carries.
@@ -480,6 +491,10 @@ class TinyfishSearchSource:
         #: be under. Without this any stranger's post counts as an official
         #: programme announcement and suppresses genuine early alerts.
         self.allowed_authors = tuple(a.strip("/").lower() for a in allowed_authors)
+        #: Tinyfish pages are zero-based and currently stop at page 10. Keep a
+        #: smaller per-query budget by default, even when the response says
+        #: more results exist, so one broad query cannot consume the scan.
+        self.max_pages = max_pages
 
     @property
     def configured(self) -> bool:
@@ -498,41 +513,76 @@ class TinyfishSearchSource:
                 self.name.value,
                 "TINYFISH_API_KEY is not set, so this source cannot be read",
             )
+        seen: set[str] = set()
         for query in self.queries:
-            params = {"query": query, "location": "US", "language": "en"}
-            if self.recency_minutes:
-                params["recency_minutes"] = str(self.recency_minutes)
-            encoded = urllib.parse.urlencode(params)
-            payload, _ = get_json(
-                f"{self.endpoint}?{encoded}",
-                source=self.name.value,
-                headers={"X-API-Key": api_key},
-            )
-            if not isinstance(payload, dict):
-                raise SourceError(self.name.value, "expected a JSON object")
-            records = payload.get("results")
-            if not isinstance(records, list):
-                LOGGER.warning("%s: no 'results' array for a query", self.name.value)
-                continue
-            for record in records:
-                if not isinstance(record, dict):
-                    continue
-                url = str(record.get("url") or "")
-                if not is_allowed_public_url(self.name, url, self.allowed_authors):
-                    continue
-                yield Evidence(
-                    source=self.name,
-                    external_id=_canonical_id(url),
-                    url=url,
-                    title=str(record.get("title") or ""),
-                    excerpt=str(record.get("snippet") or ""),
-                    metadata={
-                        "query": query,
-                        "site_name": record.get("site_name"),
-                        "position": record.get("position"),
-                        "recency_minutes": self.recency_minutes,
-                    },
+            for page in range(self.max_pages):
+                params = {
+                    "query": query,
+                    "location": "US",
+                    "language": "en",
+                    "page": str(page),
+                }
+                if self.recency_minutes:
+                    params["recency_minutes"] = str(self.recency_minutes)
+                encoded = urllib.parse.urlencode(params)
+                payload, _ = get_json(
+                    f"{self.endpoint}?{encoded}",
+                    source=self.name.value,
+                    headers={"X-API-Key": api_key},
                 )
+                if not isinstance(payload, dict):
+                    raise SourceError(self.name.value, "expected a JSON object")
+                records = payload.get("results")
+                if not isinstance(records, list):
+                    LOGGER.warning("%s: no 'results' array for a query", self.name.value)
+                    break
+                for record in records:
+                    if not isinstance(record, dict):
+                        continue
+                    url = str(record.get("url") or "")
+                    if not is_allowed_public_url(self.name, url, self.allowed_authors):
+                        continue
+                    external_id = _canonical_id(url)
+                    if external_id in seen:
+                        continue
+                    seen.add(external_id)
+                    yield Evidence(
+                        source=self.name,
+                        external_id=external_id,
+                        url=url,
+                        title=str(record.get("title") or ""),
+                        excerpt=str(record.get("snippet") or ""),
+                        metadata={
+                            "query": query,
+                            "page": page,
+                            "site_name": record.get("site_name"),
+                            "position": record.get("position"),
+                            "recency_minutes": self.recency_minutes,
+                        },
+                    )
+                if not records or not _tinyfish_has_more(payload, page):
+                    break
+
+
+def _tinyfish_has_more(payload: dict[str, object], page: int) -> bool:
+    """Follow only explicit pagination signals; never guess from a full page."""
+    pagination = payload.get("pagination")
+    containers = [payload]
+    if isinstance(pagination, dict):
+        containers.append(pagination)
+    for container in containers:
+        for key in ("has_more", "hasMore", "more_results_available"):
+            value = container.get(key)
+            if isinstance(value, bool):
+                return value
+        for key in ("next_page", "nextPage"):
+            value = container.get(key)
+            if value is not None and value is not False:
+                return True
+        total_pages = container.get("total_pages", container.get("totalPages"))
+        if isinstance(total_pages, int):
+            return page + 1 < total_pages
+    return False
 
 
 def _canonical_id(url: str) -> str:
@@ -640,6 +690,7 @@ def _accounts(name: str, default: str) -> tuple[str, ...]:
 #: labelled or compared as a YC claim.
 _YC_TERMS = (
     '"got into YC"',
+    '"got into Y Combinator"',
     '"accepted into Y Combinator"',
     '"got accepted into YC"',
 )
@@ -681,30 +732,74 @@ def social_sources(*, recency_minutes: int | None = None) -> list[TinyfishSearch
     ]
 
 
-def official_sources() -> list[TinyfishSearchSource]:
-    """Snapshots of what each programme itself has posted, scoped per programme."""
+_MAX_OFFICIAL_IDENTITIES = 10
+_OFFICIAL_IDENTITY_GROUP_SIZE = 5
+
+
+def _identity_query_terms(names: Iterable[str]) -> list[str]:
+    """Make a bounded set of exact-name OR groups for official-account search."""
+    clean: list[str] = []
+    seen: set[str] = set()
+    for raw in names:
+        name = " ".join(str(raw).split()).strip()[:120]
+        key = name.casefold()
+        if not name or key in seen:
+            continue
+        seen.add(key)
+        # Search syntax treats quotes and backslashes specially. Strip them
+        # rather than letting a company name alter the surrounding query.
+        safe_name = name.replace('"', "").replace("\\", "")
+        if not safe_name:
+            continue
+        clean.append(f'"{safe_name}"')
+        if len(clean) == _MAX_OFFICIAL_IDENTITIES:
+            break
+    return [
+        f"({' OR '.join(clean[index:index + _OFFICIAL_IDENTITY_GROUP_SIZE])})"
+        for index in range(0, len(clean), _OFFICIAL_IDENTITY_GROUP_SIZE)
+    ]
+
+
+def official_sources(
+    company_names: Mapping[str, Iterable[str]] | None = None,
+) -> list[TinyfishSearchSource]:
+    """Official snapshots, including bounded exact searches for current candidates.
+
+    `company_names` is supplied from same-cycle social discovery by the monitor.
+    It is capped to ten identities per programme, grouped five at a time, so a
+    noisy result set cannot fan out into unbounded public-index requests.
+    """
     batch_terms = [f'"{batch}"' for batch in _batches()]
+    company_names = company_names or {}
+    yc_terms = [*batch_terms, *_identity_query_terms(company_names.get(PROGRAMME_YC, ()))]
+    speedrun_terms = [
+        '"Speedrun"',
+        *_identity_query_terms(company_names.get(PROGRAMME_SPEEDRUN, ())),
+    ]
     yc_x = _accounts("LAUNCHSIGNAL_OFFICIAL_X", "ycombinator")
     yc_li = _accounts("LAUNCHSIGNAL_OFFICIAL_LINKEDIN", "y-combinator")
     sr_x = _accounts("LAUNCHSIGNAL_OFFICIAL_SPEEDRUN_X", "a16z,speedrun")
     return [
         TinyfishSearchSource(
             Source.OFFICIAL_X,
-            [f"site:x.com/{account} {term}" for account in yc_x for term in batch_terms],
+            [f"site:x.com/{account} {term}" for account in yc_x for term in yc_terms],
             allowed_authors=yc_x,
             programme=PROGRAMME_YC,
+            max_pages=2,
         ),
         TinyfishSearchSource(
             Source.OFFICIAL_LINKEDIN,
-            [f"site:linkedin.com/company/{account} {term}" for account in yc_li for term in batch_terms],
+            [f"site:linkedin.com/company/{account} {term}" for account in yc_li for term in yc_terms],
             allowed_authors=yc_li,
             programme=PROGRAMME_YC,
+            max_pages=2,
         ),
         TinyfishSearchSource(
             Source.OFFICIAL_X,
-            [f'site:x.com/{account} "Speedrun"' for account in sr_x],
+            [f"site:x.com/{account} {term}" for account in sr_x for term in speedrun_terms],
             allowed_authors=sr_x,
             programme=PROGRAMME_SPEEDRUN,
+            max_pages=2,
         ),
     ]
 

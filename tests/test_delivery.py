@@ -141,14 +141,49 @@ class DeadLetterTest(MonitorCase):
         report = health_report(self.store, self.notifier)
         self.assertEqual(len(report["undelivered_alerts"]), 1)
 
-    def test_an_alert_stranded_in_sending_is_recovered(self) -> None:
-        """A process killed mid-send leaves 'sending'; nothing else would retry it."""
+    def test_a_fresh_sending_alert_is_not_replayed(self) -> None:
+        """A second scan must not duplicate a request that may still be running."""
         alert = make_alert("Stranded")
         self.store.claim_alert(alert)
         self.assertEqual(self.store.alert_state(alert.alert_key), "sending")
-        self.assertEqual(
-            [row["alert_key"] for row in self.store.pending_alerts()], [alert.alert_key]
+        self.assertEqual(self.store.pending_alerts(), [])
+
+    def test_an_alert_stranded_in_sending_is_recovered_after_lease(self) -> None:
+        """A process killed mid-send is atomically replayed after its lease expires."""
+        alert = make_alert("Stranded")
+        self.store.claim_alert(alert)
+        self.store.connection.execute(
+            "UPDATE alerts SET delivery_started_at = ? WHERE alert_key = ?",
+            ("2000-01-01T00:00:00+00:00", alert.alert_key),
         )
+        self.store.connection.commit()
+
+        healthy = RecordingNotifier()
+        result = Monitor(self.store, healthy).run(
+            [FakeSource(Source.YC_DIRECTORY, [])], []
+        )
+
+        self.assertEqual(result["retried"], 1)
+        self.assertEqual([item.company_name for item in healthy.sent], ["Stranded"])
+        self.assertEqual(self.store.alert_state(alert.alert_key), "sent")
+
+    def test_a_legacy_sending_alert_without_a_lease_is_recovered(self) -> None:
+        """Rows written before schema v4 have NULL leases and cannot stay wedged."""
+        alert = make_alert("Legacy")
+        self.store.claim_alert(alert)
+        self.store.connection.execute(
+            "UPDATE alerts SET delivery_started_at = NULL WHERE alert_key = ?",
+            (alert.alert_key,),
+        )
+        self.store.connection.commit()
+        healthy = RecordingNotifier()
+
+        result = Monitor(self.store, healthy).run(
+            [FakeSource(Source.YC_DIRECTORY, [])], []
+        )
+
+        self.assertEqual(result["retried"], 1)
+        self.assertEqual(self.store.alert_state(alert.alert_key), "sent")
 
 
 class ScanLockTest(MonitorCase):

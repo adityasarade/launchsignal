@@ -177,7 +177,10 @@ def headline(alert: Alert) -> str:
     """
     if alert.kind is SignalKind.EARLY_FOUNDER_CLAIM:
         if alert.official.state is OfficialState.NOT_SEEN:
-            return "EARLY YC SIGNAL — Founder Announced Before YC"
+            return (
+                f"EARLY {alert.programme.upper()} SIGNAL — "
+                f"Founder Announced Before {alert.programme}"
+            )
         if alert.official.state is OfficialState.SEEN:
             return "FOUNDER POST — already announced officially"
         return "FOUNDER CLAIM — unverified (no official check configured)"

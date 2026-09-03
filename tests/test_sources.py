@@ -237,6 +237,16 @@ class QueryRegistryTest(unittest.TestCase):
         for source in sources.official_sources():
             self.assertTrue(source.allowed_authors, "an official source must pin an account")
 
+    def test_official_queries_include_current_candidate_names_bounded(self) -> None:
+        names = [f"Company {index}" for index in range(12)]
+        registry = sources.official_sources({"YC": names})
+        yc_queries = " ".join(
+            query for source in registry if source.programme == "YC" for query in source.queries
+        )
+        self.assertIn('"Company 0"', yc_queries)
+        self.assertIn('"Company 9"', yc_queries)
+        self.assertNotIn('"Company 10"', yc_queries)
+
     def test_batches_are_configurable(self) -> None:
         import os
         os.environ["LAUNCHSIGNAL_BATCHES"] = "YC S27,YC W27"
@@ -376,6 +386,44 @@ class BaselineEnrichmentTest(unittest.TestCase):
                 store.close()
         self.assertTrue([c for c in calls if "sitemap" not in c], "should fetch profiles")
         self.assertTrue(any(i.batch == "YC F24" for i in items))
+
+    def test_transient_profile_failure_is_retried_without_a_new_baseline(self) -> None:
+        """A failed new profile remains eligible next cycle, not stranded."""
+        import tempfile
+
+        from launchsignal.store import Store, company_key
+
+        calls: list[str] = []
+        failed_once = {"fresco"}
+
+        def fake_get_text(url, **kwargs):
+            calls.append(url)
+            if "sitemap" in url:
+                return SITEMAP, type("R", (), {"etag": '"e"'})()
+            slug = url.rsplit("/", 1)[-1]
+            if slug in failed_once:
+                failed_once.remove(slug)
+                raise SourceError("yc_directory:profile", "temporary upstream error")
+            return PROFILE, type("R", (), {"etag": None})()
+
+        original = sources.get_text
+        sources.get_text = fake_get_text
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(f"{directory}/s.sqlite3")
+            try:
+                store.complete_baseline("yc_directory")
+                first = list(sources.YcSitemapSource().scan(store))
+                # Simulate normal monitor ingestion of the successful listing.
+                for item in first:
+                    store.record_observation(item, company_key(item.company_name or "", "YC"))
+                second = list(sources.YcSitemapSource().scan(store))
+            finally:
+                sources.get_text = original
+                store.close()
+        self.assertEqual([item.external_id for item in first], ["ticket-wallet"])
+        self.assertIn("fresco", [item.external_id for item in second])
+        self.assertEqual(calls.count("https://www.ycombinator.com/companies/fresco"), 2)
+        self.assertEqual(calls.count("https://www.ycombinator.com/companies/ticket-wallet"), 1)
 
 
 class ExcludedSlugTest(unittest.TestCase):
